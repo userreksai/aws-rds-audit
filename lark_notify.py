@@ -143,6 +143,11 @@ def build_lark_payloads(report, config, *, access_password=None):
         lines.append("【采集或解析不完整，请检查报告并补跑】")
     if meta.get("period_kind") == "custom":
         lines.append("窗口类型：自定义时间窗口报告")
+    if meta.get("source_cache"):
+        coverage = meta["source_cache"]
+        if coverage.get("revision"):
+            lines.append("【补采或延迟日志到达后修订日报】")
+        lines.append(f"本地分段覆盖：{int(coverage.get('selected_segments', 0))}/{int(coverage.get('expected_segments', 0))}；缺失 {len(coverage.get('missing_segments', []))} 段。")
     lines.append("新增：{}　删除：{}　修改：{}".format(*(int(counts.get(key, 0)) for key in ("新增", "删除", "修改"))))
     lines.append("口径：未报错的API调用与SQL语句记录；不等于最终资源状态或事务提交。")
     for key, label in (("management", "RDS管理API"), ("sql", "数据库SQL审计")):
@@ -238,6 +243,25 @@ def send_lark_notification(report, config, *, opener=None, now=None, sleep=None,
     if config.get("message_mode", "summary") == "full":
         return {"code": 0, "messages_sent": sent}
     return result
+
+
+def send_lark_alert(alert, config, *, opener=None, now=None):
+    """Operational alerts contain scope/status only, never SQL or credentials."""
+    kind = str(alert.get("type") or alert.get("kind") or "collection_failure")
+    recovered = "recover" in kind or "recovery" in kind
+    title = "RDS采集恢复通知" if recovered else "RDS采集告警"
+    lines = [title, "事件：" + _fragment(kind, 80)]
+    for key, label in (("event_id", "事件编号"), ("account_id", "账号"), ("regions", "区域"), ("source_service", "服务"), ("bucket_start", "分段开始"), ("bucket_end", "分段结束"), ("start", "开始"), ("end", "结束"), ("attempts", "累计尝试"), ("missing_count", "缺失分段数"), ("occurred_at", "记录时间")):
+        if alert.get(key) is not None:
+            lines.append(label + "：" + _fragment(alert[key], 180))
+    message = str(alert.get("message") or alert.get("error") or alert.get("last_error") or "请检查服务器采集状态和日志。")
+    # Apply common credential-key redaction to unexpected transport diagnostics.
+    message = re.sub(r"(?i)(secret(?:accesskey)?|sessiontoken|password|webhook|authorization)\s*[=:]\s*\S+", r"\1=[REDACTED]", message)
+    lines.append("信息：" + _fragment(message, 900))
+    lines.append("服务器日志：journalctl -u aws-rds-audit-collect.service -n 100 --no-pager")
+    payload = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
+    webhook = validate_webhook_url(config.get("webhook_url", ""))
+    return _send_payload(_signed_payload(payload, config.get("signing_secret", ""), now), webhook, opener)
 
 
 def main(argv=None):

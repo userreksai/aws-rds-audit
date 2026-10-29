@@ -1,6 +1,6 @@
 # RDS MySQL / Aurora MySQL 操作记录采集
 
-HTML 日报、Lark 汇总和 Linux 安装/定时服务的部署说明见 [README.md](README.md)。本文说明自定义时间窗口采集、SQL 审计配置与证据边界；下面不带 `--daily` 的命令保留原始时间窗口行为，并自动生成按该窗口汇总的 HTML。
+半小时/小时增量采集、失败重试、Lark 告警、每日缓存汇总和 Linux 部署命令见 [README.md](README.md)。本文说明过滤口径、自定义窗口、SQL 审计设置与证据边界。下面的一次性采集命令保留真实查询窗口，并自动生成轻量分页 HTML。
 
 `rds_audit.py` 是独立的只读采集脚本，使用 boto3 获取当前 AWS 账号可见的 RDS 管理操作、服务事件、审计配置和已有数据库日志。它不连接数据库，也不修改实例、参数组或日志配置。
 
@@ -8,14 +8,14 @@ HTML 日报、Lark 汇总和 Linux 安装/定时服务的部署说明见 [README
 
 | 记录 | 数据来源 | 能回答的问题 | 范围限制 |
 | --- | --- | --- | --- |
-| RDS 管理操作 | CloudTrail `LookupEvents` | 谁在何时从哪个 IP 调用了创建、修改、删除、重启、快照等 RDS API，提交了哪些参数，调用是否报错 | 当前账号、所选区域、最近 90 天，包含读取和写入 API |
+| RDS 管理变更 | CloudTrail `LookupEvents` | 哪个 AWS 身份在何时从哪个 IP 调用了可归入新增、删除、修改的 RDS API，参数与结果 | 当前账号、所选区域、最近 90 天；过滤读取及非增删改 API，保留失败的变更请求 |
 | RDS 服务事件 | RDS `DescribeEvents` | 备份、故障切换、维护等服务通知 | 最近 14 天，不能替代操作审计 |
-| 数据库内部 SQL | 已存在的 audit / general 日志 | 日志记录的数据库用户、来源、时间、SQL 等 | 必须在当时已启用相应日志，且日志仍在保留期内 |
+| 数据库内部 SQL | 已存在的 CloudWatch audit 日志 | 数据库账号、来源、时间、增删改 SQL 与返回码 | 必须当时已开启并保留；常规模式排除查询与辅助事件，general 只列目录 |
 | 当前审计配置 | RDS 实例、集群、参数组、选项组 | 当前配置了哪些审计事件、用户过滤和日志导出 | 当前配置不能证明过去已经启用，也不能单独证明已在数据库运行时生效 |
 
 CloudTrail 管理事件不包含普通 MySQL 客户端执行的 `INSERT`、`UPDATE`、`DELETE`。即使通过 Aurora Data API 执行 SQL，CloudTrail 的相关 API 记录也不会展示 SQL 正文；Data API 数据事件亦不由本脚本采集。参见 [CloudTrail 查询范围](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_LookupEvents.html)、[RDS Data API 的 CloudTrail 记录](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/logging-using-cloudtrail-data-api.html)。
 
-“所有操作”只能理解为指定范围内、服务实际记录且当前身份有权读取的全部可见记录。以前没开 SQL 审计、用户或事件被排除、SQL 被截断、日志已轮转删除的内容，脚本无法补录。超过 90 天的管理操作需要查询原先保存在 S3 Trail 或 CloudTrail Lake 的记录，本脚本不读取这些归档。
+当前交付范围为增删改审计，不输出所有读取操作。可见性仍受账号、区域、权限、时间窗口和服务实际记录范围限制。以前没开 SQL 审计、用户或事件被排除、SQL 被截断、日志已轮转删除的内容，脚本无法补录。超过 90 天的管理操作需要查询原先保存在 S3 Trail 或 CloudTrail Lake 的记录，本脚本不读取这些归档。
 
 ## 安装与身份
 
@@ -46,7 +46,7 @@ python3 -m venv .venv
 .\.venv\Scripts\python.exe rds_audit.py --profile audit --regions ap-southeast-1 --days 7
 ```
 
-同时导出已有 CloudWatch audit / general 日志：
+同时采集已有 CloudWatch audit 日志中的增删改原文片段（general 不下载正文）：
 
 ```powershell
 .\.venv\Scripts\python.exe rds_audit.py --profile audit --regions ap-southeast-1 --days 7 --download-sql-logs
@@ -66,7 +66,7 @@ Linux 将命令中的 Python 替换为 `.venv/bin/python`。`--regions` 默认 `
 .\.venv\Scripts\python.exe rds_audit.py --profile audit --regions ap-southeast-1 --start 2026-10-27T00:00:00+07:00 --end 2026-10-29T00:00:00+07:00 --download-sql-logs
 ```
 
-这表示曼谷时间 10 月 27 日零点至 10 月 29 日零点，查询左闭右开，输出时间统一为 UTC。不要将不带时区的本地时间作为输入。`--days` 默认 7，必须大于 0 且小于 90；精确窗口使用 `--start` / `--end` 替代它。早于近 90 天范围的请求会被拒绝，边界保留 1 分钟余量；服务事件只查询该窗口与最近 14 天的交集，同样预留 1 分钟边界余量。CloudWatch 原始记录里的毫秒时间戳保持原样。
+这表示曼谷时间 10 月 27 日零点至 10 月 29 日零点，查询左闭右开；采集元数据保存 UTC，HTML 展示北京时间。不要将不带时区的本地时间作为输入。`--days` 默认 7，必须大于 0 且小于 90；精确窗口使用 `--start` / `--end` 替代它。早于近 90 天范围的请求会被拒绝，边界保留 1 分钟余量；服务事件只查询该窗口与最近 14 天的交集，同样预留 1 分钟边界余量。CloudWatch 原始记录里的毫秒时间戳保持原样。
 
 若没有 CloudWatch 日志，但数据库实例上仍有 audit / general 文件，可用备用下载方式：
 
@@ -74,7 +74,7 @@ Linux 将命令中的 Python 替换为 `.venv/bin/python`。`--regions` 默认 `
 .\.venv\Scripts\python.exe rds_audit.py --profile audit --regions ap-southeast-1 --download-instance-logs
 ```
 
-此方式下载当前 MySQL / Aurora MySQL 实例仍可见的相关文件，**下载整文件，不按上述时间窗口裁剪**。它会使用数据库实例资源，日志量大时优先使用 CloudWatch 导出方式。两种下载开关可以一起使用，可能包含重复的底层 SQL 记录。[AWS 的实例日志下载说明](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DownloadDBLogFilePortion.html)
+这是显式的原始取证选项，下载当前 MySQL / Aurora MySQL 实例仍可见的 audit / general **整文件，不按窗口或增删改过滤**，因此可能包含 SELECT、业务查询和重复 SQL；不用于定时增量采集，也不额外叠加到 audit 增删改统计。下载会使用实例资源，日志量大时优先使用 CloudWatch 方式。[AWS 的实例日志下载说明](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DownloadDBLogFilePortion.html)
 
 ## 输出与结果判断
 
@@ -83,16 +83,19 @@ Linux 将命令中的 Python 替换为 `.venv/bin/python`。`--regions` 默认 `
 ```text
 reports/rds/<AWS账号ID>/<本次运行目录>/
   report.json                  账号、时间窗口、各区域采集状态、配置、日志目录和错误
-  management-events.jsonl       CloudTrail RDS 管理操作，逐行 JSON
+  management-events.jsonl       筛选后的 CloudTrail RDS 管理增删改
   rds-events.jsonl              RDS 服务事件，逐行 JSON
-  cloudwatch/*.jsonl            可选的 CloudWatch SQL 原始日志
+  cloudwatch/*.jsonl            可选，audit 增删改原文片段及源记录位置
+  quarantine/sql-unclassified.jsonl  可选，无法分类或解析的证据
   instance-logs/*.log           可选的实例原始日志
   daily-report.json            规范化统计、操作者与具体操作明细
   YYYY-MM-DD-rds操作审计-自定义窗口.html  自定义窗口 HTML 汇总
+  <报告名>-pages-<hash>/        每页最多 100 条的按需明细
+  <报告名>-完整报告.zip         总览、CSS 和分页目录，不含完整 JSON/原始日志
   rds-report.css               HTML 配套样式
 ```
 
-所有实际采集命令都会自动生成 HTML。`--days`、`--start` / `--end` 或默认最近 7 天使用真实查询窗口，HTML 不会套用固定日报的 25 小时范围；定时 `--daily` 仍生成原有日报文件名。查看 HTML 时保留同目录 CSS。显式自定义窗口也可选用 `--send-lark` 与 `--publish-dir`；不提供这些开关就不会推送或发布。
+一次性采集命令会自动生成 HTML；增量采集先写分段缓存，日报再统一生成。`--days`、`--start` / `--end` 或默认最近 7 天使用真实查询窗口，HTML 不会套用固定日报的 25 小时范围；定时缓存日报仍生成原有日报文件名。首页仅预览 20 条记录、100 位操作者，不自动载入完整 JSON。页面内置样式并有外部 CSS 回退；查看明细必须保留同目录分页文件夹，或下载并解压完整报告 ZIP。长 SQL 与大字段的完整值保存在服务器 `daily-report.json`。显式自定义窗口也可选用 `--send-lark` 与 `--publish-dir`；不提供这些开关就不会推送或发布。
 
 已有下载目录可以直接生成 HTML，无需重新拉取。例如：
 
@@ -103,13 +106,17 @@ cd /usr/local/aws-rds-shenji
 
 不加 `--date` / `--daily` 时使用该目录 `report.json` 保存的完整原窗口；新元数据中的 `period_kind` 会保留，旧目录没有该字段时作为自定义窗口。上述目录的窗口为北京时间 2026-10-28 17:32:55 至 2026-10-29 17:32:55，不要求覆盖另一个 25 小时日报窗口。原始 JSONL 会保留，离线生成不连接 AWS。若显式加 `--date` 或 `--daily`，仍会检查原数据是否完整覆盖请求的固定日报窗口。
 
-下载 40,510 条 CloudWatch 事件不代表发生 40,510 次增删改。汇总按解析后的操作记录分类；失败、辅助事件和不能可靠解析的内容按报告口径分别展示，解析失败会保留证据并标记采集或解析不完整。
+下载 40,510 条 CloudWatch 事件不代表发生 40,510 次增删改。旧目录离线生成同样先排除查询与辅助事件，再汇总变更；原始文件不修改。增删改数量为未报错的请求/语句条数，失败的增删改保留在失败数和明细。未知或解析失败证据单独展示并标记不完整。
 
-默认不下载 SQL 正文，仅列出现有日志和审计配置。管理事件按 `rds.amazonaws.com` 查询，不要求资源仍存在，因此已删除实例的管理记录仍可收录。CloudWatch 日志目录也直接扫描现存的标准 RDS audit / general 日志组，涵盖已删除实例留下的日志，不只依赖当前导出开关。
+一次性采集未加 `--download-sql-logs` 时只列日志与审计配置，不下载 SQL 正文；`--daily` 直接采集和增量采集自动请求 audit 增删改。管理事件按 `rds.amazonaws.com` 查询，不要求资源仍存在，因此已删除实例的管理记录仍可收录。CloudWatch 日志目录也直接扫描现存的标准 RDS audit / general 日志组，涵盖已删除实例留下的日志，不只依赖当前导出开关。
 
 CloudWatch 标准路径为 `/aws/rds/instance/<实例标识>/audit`、`/general`，Aurora 为 `/aws/rds/cluster/<集群标识>/audit`、`/general`，集群内各实例对应不同日志流。自定义转发目的地、S3 归档、其他账号和非标准路径不在该扫描范围。
 
-脚本按分页继续读取，不因 CloudWatch 某一页为空而提前结束；不以 `INSERT` 等关键词过滤，以免漏掉多行语句、注释、预编译语句或其他日志格式。导出的 SQL 日志可能包含业务数据，请将输出目录放在受控位置，不要直接作为公开网页目录。
+脚本按分页读取，不因 CloudWatch 某一页为空而提前结束。请求端不使用简单 INSERT 关键词筛选；收到候选事件后解析 CSV、多行内容与 SQL 开头命令，再按确定的变更分类保存。它不靠关键字出现位置猜测：纯 SELECT 被排除，INSERT … SELECT 仍保留；无法确定的预编译调用、复杂语句、格式异常和截断记录单独隔离并将报告标为不完整。
+
+`report.json` 的下载统计区分 `received_event_count`（候选事件）、`event_count`（保留的事件封装）、`change_record_count`（变更记录）、过滤查询/辅助数与隔离数。同一封装可含多条语句，三个数量不能互换。只保留其中的变更片段时，`original_record_indexes` 保持源记录位置，供去重和核查。源 CloudWatch 日志不被修改。
+
+归档可能含 SQL 业务值，请保存在受控位置。`--publish-dir` 仅发布总览、CSS、分页和 ZIP，不发布完整 JSON/JSONL；ZIP 同样不包含原始证据。
 
 退出码：
 
@@ -122,6 +129,19 @@ CloudWatch 标准路径为 `/aws/rds/instance/<实例标识>/audit`、`/general`
 采集或解析不完整的退出码 `2` 优先于后续发布或通知错误。
 
 查询结果为空还应检查账号、区域、时间范围、保留期、审计事件类别和用户过滤。日志发布存在延迟，刚发生的操作可稍后重查。
+
+
+## 增量缓存与日报覆盖
+
+生产定时任务使用 `--collect-incremental`，每段 30 或 60 分钟，成功快照与 SQLite 检查点按账号、profile、区域、间隔和过滤版本隔离。默认每次最多处理 6 段，回看 26 小时；采集器每 5 分钟检查新段及失败重试，预留 5 分钟发布缓冲。成功段结束约 60 分钟后额外复采一次，捕获部分延迟日志。过滤发生在本地归档前，不能减少数据库已生成的源审计量，也不保证 AWS 候选事件网络传输量下降。
+
+分段失败先进行最多 3 次短重试，再按 5 分钟起、最多 1 小时跨轮退避。已发现的旧失败/待采段不会因移出 26 小时窗口而丢弃，在近 89 天范围内继续补采。格式或分类问题作为质量不完整保存，不无限重复下载同一段。状态、失败/恢复通知和待投递告警落盘；告警发送失败由后续调用重试，详情见 [README.md](README.md)。
+
+`--daily --from-cache` 只读取本地快照，不调用 AWS；每日 25 小时需要 50 个半小时段或 25 个一小时段。缺段、失败或校验损坏会显示不完整、发送告警并加入修复队列，不按 0 次处理。必须使用与采集相同的 profile、regions、interval 和 cache-dir；有多个匹配账号时指定 `--cache-account-id`。
+
+当日已发日报若收到窗口内分段恢复或迟到数据会自动修订，内容未改变不自动重发；历史日期需手动 `--daily --from-cache --date YYYY-MM-DD` 补报。延迟复采有限、日志保留也有限，因此“检查点成功”仅证明该次可见数据已完整读取，不承诺源端未来不会新增日志。
+
+采集与汇总使用共同进程锁，日报遇忙排队，首次失败也保留请求供后续定时任务重试。缓存与历史报告不自动清理，应另行安排磁盘容量、归档与保留期。
 
 ## MySQL 与 Aurora 的 SQL 审计区别
 

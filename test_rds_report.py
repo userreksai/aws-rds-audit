@@ -71,13 +71,15 @@ class ReportFixture(unittest.TestCase):
         sql_row = next(row for row in result["events"] if row["source_kind"] == "sql" and row["event_id"] == "s1:0")
         self.assertIn("不证明事务提交", sql_row["result"])
 
-    def test_management_event_id_deduplicates_across_envelopes_and_keeps_read_calls(self):
+    def test_management_event_id_deduplicates_and_excludes_read_calls(self):
         event = management("same", "DescribeDBInstances", readOnly=True)
-        self.save([event, {**event, "region": "us-east-1"}], [])
+        change = management("change", "CreateDBInstance")
+        self.save([event, change, {**change, "region": "us-east-1"}], [])
         result = self.build()
         self.assertEqual(len(result["events"]), 1)
-        self.assertEqual(result["metadata"]["counts"]["其他操作"], 1)
-        self.assertEqual(result["metadata"]["counts"]["新增"], 0)
+        self.assertEqual(result["metadata"]["counts"]["其他操作"], 0)
+        self.assertEqual(result["metadata"]["counts"]["新增"], 1)
+        self.assertEqual(result["coverage"]["filtered_management"], 1)
         self.assertEqual(result["events"][0]["actor"], "ops/session-123")
 
     def test_sql_event_id_dedup_does_not_merge_different_streams(self):
@@ -122,8 +124,64 @@ class ReportFixture(unittest.TestCase):
         self.save([], [audit_event("UPDATE users SET enabled=1"), audit_event("users", operation="WRITE", event_id="table")])
         result = self.build()
         self.assertEqual(result["metadata"]["counts"]["修改"], 1)
-        self.assertEqual(result["metadata"]["total"], 2)
+        self.assertEqual(result["metadata"]["total"], 1)
         self.assertEqual(result["metadata"]["counted_total"], 1)
+        self.assertEqual(result["coverage"]["filtered_auxiliary"], 1)
+
+    def test_queries_are_removed_before_primary_events_but_failed_writes_remain(self):
+        self.save([], [
+            audit_event("SELECT * FROM t", event_id="select"),
+            audit_event("show tables", event_id="show"),
+            audit_event("INSERT INTO target SELECT * FROM source", event_id="insert-select"),
+            audit_event("DELETE FROM t", event_id="failed-write", code=1142),
+            audit_event("CALL change_balance(1)", event_id="unknown"),
+        ])
+        result = self.build()
+        self.assertEqual(result["metadata"]["total"], 2)
+        self.assertEqual(result["metadata"]["failed_or_partial"], 1)
+        self.assertEqual(result["metadata"]["counts"]["新增"], 1)
+        self.assertEqual(result["metadata"]["counts"]["删除"], 0)
+        self.assertEqual(result["coverage"]["filtered_queries"], 2)
+        self.assertEqual(result["coverage"]["unclassified"], 1)
+        self.assertEqual(result["unparsed"][0]["reason"], "unclassified_sql")
+        self.assertFalse(result["metadata"]["complete"])
+        self.assertTrue(all(row["category"] in report.CHANGE_CATEGORIES for row in result["events"]))
+
+    def test_filtered_envelopes_preserve_original_record_indexes(self):
+        first = audit_event("INSERT INTO t VALUES(1)")
+        second = audit_event("UPDATE t SET x=1")
+        first["message"] += "\n" + second["message"]
+        first["original_record_indexes"] = [2, 7]
+        self.save([], [first])
+        result = self.build()
+        self.assertEqual([row["event_id"] for row in result["events"]], ["s1:2", "s1:7"])
+        self.assertEqual(result["metadata"]["total"], 2)
+
+    def test_invalid_record_index_mapping_is_evidence_not_fake_change_ids(self):
+        value = audit_event()
+        value["original_record_indexes"] = [True]
+        self.save([], [value])
+        result = self.build()
+        self.assertEqual(result["events"], [])
+        self.assertFalse(result["metadata"]["complete"])
+        self.assertIn("original_record_indexes", result["unparsed"][0]["message"])
+
+    def test_collection_filter_totals_and_quarantine_are_combined_without_counting_uncertain_sql(self):
+        unknown = audit_event("CALL f()", event_id="uncertain")
+        self.collection["regions"] = {"ap-east-1": {"filtered_management_event_count": 7, "sql_log_groups": [{"download": {"filtered_read_record_count": 10, "filtered_auxiliary_record_count": 4}}]}}
+        self.save([management("read", "DescribeDBInstances", readOnly=True)], [audit_event("SELECT 1", event_id="select"), audit_event("table", event_id="aux", operation="WRITE"), unknown, audit_event("UPDATE t SET x=1", event_id="write")])
+        quarantine = self.directory / "quarantine"
+        quarantine.mkdir()
+        evidence = {**unknown, "reason": "unclassified_sql", "record_index": 0, "raw": unknown["message"]}
+        (quarantine / "sql-unclassified.jsonl").write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+        result = self.build()
+        self.assertEqual(result["metadata"]["total"], 1)
+        self.assertEqual(result["coverage"]["filtered_management"], 8)
+        self.assertEqual(result["coverage"]["filtered_queries"], 11)
+        self.assertEqual(result["coverage"]["filtered_auxiliary"], 5)
+        self.assertEqual(result["coverage"]["unclassified"], 1)
+        self.assertEqual(result["coverage"]["unparsed_records"], 1)
+        self.assertFalse(result["metadata"]["complete"])
 
     def test_multiple_records_in_one_cloudwatch_message(self):
         first, second = audit_event("INSERT INTO t VALUES (1)"), audit_event("DROP TABLE t")
@@ -143,7 +201,7 @@ class ReportFixture(unittest.TestCase):
         self.assertEqual(result["metadata"]["total"], 0)
         self.assertEqual(result["coverage"]["unparsed_records"], 1)
         self.assertIn("UPDATE users", result["unparsed"][0]["raw"])
-        self.assertIn("未解析审计记录", report.generate_html(result))
+        self.assertIn("隔离证据", report.generate_html(result))
 
     def test_collection_errors_and_invalid_json_never_become_no_activity(self):
         self.collection["checks"] = [{"scope": "eu-north-1:cloudtrail", "status": "error", "message": "AccessDenied"}]
@@ -168,7 +226,7 @@ class ReportFixture(unittest.TestCase):
             self.assertNotIn(secret, stored)
         self.assertNotIn("<script>", markup)
         self.assertIn("&lt;script&gt;", markup)
-        self.assertNotIn("<style", markup)
+        self.assertIn("<style", markup)
         self.assertIn('href="rds-report.css?v=', markup)
 
     def test_static_html_json_and_css_are_written_together(self):

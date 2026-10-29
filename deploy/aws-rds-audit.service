@@ -1,10 +1,12 @@
 [Unit]
-Description=AWS RDS audit daily HTML report and Lark summary
+Description=AWS RDS daily HTML report from local interval snapshots and Lark summary
 Wants=network-online.target
 After=network-online.target time-sync.target
+OnFailure=aws-rds-audit-failure@%n.service
 
 [Service]
 Type=oneshot
+SuccessExitStatus=2 3 4
 User=@RUN_USER@
 Group=@RUN_GROUP@
 WorkingDirectory=@PROJECT_ROOT@

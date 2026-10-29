@@ -174,11 +174,12 @@ class DailyPublicationTests(unittest.TestCase):
             shutil.copytree(Path(__file__).parent / "examples/daily-sample", directory)
             with patch.object(audit, "aws_session") as connection, patch.object(notify, "send_lark_notification") as send, redirect_stdout(io.StringIO()):
                 status = audit.main(["--input-dir", str(directory), "--date", "2026-10-29"])
-            self.assertEqual(status, 0)
+            self.assertEqual(status, 2)  # The sample CALL is quarantined, not guessed as read-only.
             connection.assert_not_called()
             send.assert_not_called()
             normalized = json.loads((directory / "daily-report.json").read_text(encoding="utf-8"))
             self.assertEqual([normalized["metadata"]["counts"][key] for key in ("新增", "删除", "修改")], [2, 2, 5])
+            self.assertEqual(normalized["coverage"]["unclassified"], 1)
             self.assertEqual(normalized["metadata"]["failed_or_partial"], 2)
             self.assertTrue((directory / "2026-10-29-rds操作审计.html").is_file())
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Persist and send an operational failure alert for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=@PROJECT_ROOT@
+Environment=@HOME_ENV@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/aws-rds-audit.env
+ExecStart=@PYTHON@ @RUNNER@ "%i"
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=2min
