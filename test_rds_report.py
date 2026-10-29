@@ -88,7 +88,41 @@ class ReportFixture(unittest.TestCase):
         result = self.build()
         self.assertEqual(result["metadata"]["counts"]["修改"], 2)
         self.assertEqual(result["coverage"]["duplicate_cloudwatch_events"], 1)
-        self.assertEqual(len(result["actors"]), 2)
+        self.assertEqual(len(result["actors"]), 1)
+        self.assertEqual(result["actors"][0]["total"], 2)
+        self.assertEqual(len(result["actors"][0]["contexts"]), 2)
+
+    def test_database_username_merges_instances_but_preserves_details_and_identity_sources(self):
+        writes = [audit_event("INSERT INTO t VALUES (1)", event_id="insert", stream="writer-a"),
+                  audit_event("UPDATE t SET x=2", event_id="update", stream="writer-b"),
+                  audit_event("DELETE FROM t", event_id="failed", stream="writer-c", code=1142)]
+        upper = audit_event("UPDATE t SET x=3", event_id="upper", stream="writer-a")
+        upper["message"] = upper["message"].replace(",app_user,", ",App_user,")
+        iam = management("iam", userIdentity={"type": "IAMUser", "userName": "app_user", "arn": "arn:aws:iam::123456789012:user/app_user"})
+        self.save([iam], [*writes, upper])
+        result = self.build()
+        combined = next(actor for actor in result["actors"] if actor["actor"] == "app_user" and actor["source_kind"] == "sql")
+        self.assertEqual(combined["total"], 3)
+        self.assertEqual(combined["failed"], 1)
+        self.assertEqual(combined["counts"], {"新增": 1, "删除": 0, "修改": 1, "其他操作": 0})
+        self.assertEqual(len(combined["contexts"]), 3)
+        selected = [row for row in result["events"] if row["actor_group_key"] == combined["actor_key"]]
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(len({row["actor_key"] for row in selected}), 3)
+        self.assertEqual(len(result["actors"]), 3)  # sql app_user, sql App_user, IAM app_user
+        main = report.write_report(result, self.directory)
+        from urllib.parse import unquote
+        from test_report_pages import Links
+        parsed = Links()
+        parsed.feed(main.read_text(encoding="utf-8"))
+        filename = combined["anchor"] + "-000001.html"
+        actor_link = next(link for link in parsed.hrefs if link.endswith(filename))
+        markup = (self.directory / unquote(actor_link)).read_text(encoding="utf-8")
+        self.assertEqual(markup.count("data-event-index="), 3)
+        for sql in ("INSERT INTO t VALUES (1)", "UPDATE t SET x=2", "DELETE FROM t"):
+            self.assertIn(sql, markup)
+        self.assertIn("writer-a", main.read_text(encoding="utf-8"))
+        self.assertIn("writer-c", main.read_text(encoding="utf-8"))
 
     def test_general_log_is_preserved_in_collection_but_not_double_counted(self):
         audit = audit_event()

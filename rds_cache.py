@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import time
 from uuid import uuid4
 
@@ -124,6 +125,12 @@ class CacheStore:
                 next_attempt INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
                 sent_at INTEGER, last_error TEXT
             );
+            CREATE TABLE IF NOT EXISTS quality_snapshots (
+                start INTEGER PRIMARY KEY, end INTEGER NOT NULL,
+                active_path TEXT, active_digest TEXT, quality INTEGER,
+                report_digest TEXT, report_mtime INTEGER, report_size INTEGER,
+                last_error TEXT
+            );
         """)
         self.connection.commit()
 
@@ -152,6 +159,85 @@ class CacheStore:
     def bucket(self, start: datetime):
         row = self.connection.execute("SELECT * FROM buckets WHERE start=?", (_stamp(start),)).fetchone()
         return dict(row) if row else None
+
+    def _quality_metadata(self, source, start, end):
+        """Inspect metadata only; candidate SQL files are never reread here."""
+        if not isinstance(source, dict) or str(source.get("identity", {}).get("Account", "")) != self.account_id:
+            raise ValueError("Quality snapshot belongs to another AWS account")
+        window = source.get("window") or {}
+        if _parse(window["start_inclusive"]) != start or _parse(window["end_exclusive"]) != end:
+            raise ValueError("Quality snapshot window does not match its checkpoint")
+        checks = source.get("checks", [])
+        if not isinstance(checks, list) or any(not isinstance(check, dict) for check in checks):
+            raise ValueError("Quality snapshot checks are invalid")
+        errors = [check for check in checks if check.get("status") == "error"]
+        if any(check.get("error_type") != "UnclassifiedSqlRecords" for check in errors):
+            raise ValueError("Quality snapshot contains uncommitted collection errors")
+        if source.get("collection_status") not in ("ok", "partial") or (source.get("collection_status") == "partial" and not errors):
+            raise ValueError("Quality snapshot completion status cannot be verified")
+        return int(bool(errors))
+
+    def _quality_record(self, start, end, relative, digest, *, expected=None):
+        """Cache immutable metadata; an unreadable/changed snapshot stays unknown."""
+        record = {"start": start, "end": end, "active_path": relative,
+                  "active_digest": digest, "quality": None, "report_digest": None,
+                  "report_mtime": None, "report_size": None, "last_error": None}
+        if expected:
+            record.update({key: expected[key] for key in ("quality", "report_digest", "report_mtime", "report_size")})
+        try:
+            if not relative or not digest:
+                raise ValueError("Quality snapshot has no committed active version")
+            report_path = self._snapshot_path(relative) / "report.json"
+            if not report_path.resolve().is_relative_to(self.directory):
+                raise ValueError("Quality metadata path leaves its cache scope")
+            information = report_path.stat()
+            if not stat.S_ISREG(information.st_mode):
+                raise ValueError("Quality metadata is not a regular file")
+            if (expected and expected["last_error"] is None and expected["report_digest"] and
+                    expected["report_mtime"] == information.st_mtime_ns and expected["report_size"] == information.st_size):
+                return record
+            raw = report_path.read_bytes()
+            metadata_digest = hashlib.sha256(raw).hexdigest()
+            if expected and expected["report_digest"] and expected["report_digest"] != metadata_digest:
+                raise ValueError("Committed quality metadata changed after checkpoint")
+            record.update(report_digest=metadata_digest, report_mtime=information.st_mtime_ns, report_size=information.st_size)
+            record["quality"] = self._quality_metadata(json.loads(raw.decode("utf-8-sig")), start, end)
+        except Exception as exc:
+            record["last_error"] = _safe_error(exc)
+        return record
+
+    def _save_quality_record(self, record):
+        self.connection.execute("""INSERT OR REPLACE INTO quality_snapshots
+            (start,end,active_path,active_digest,quality,report_digest,report_mtime,report_size,last_error)
+            VALUES(:start,:end,:active_path,:active_digest,:quality,:report_digest,:report_mtime,:report_size,:last_error)""", record)
+
+    def quality_status(self):
+        """Return unresolved committed snapshots, including retained historical gaps.
+
+        Metadata is backfilled lazily for pre-upgrade checkpoints. The report's
+        content hash and file stat let later calls avoid loading it repeatedly.
+        Missing ledger rows and missing/changed metadata cannot imply recovery.
+        """
+        active = {row["start"]: dict(row) for row in self.connection.execute("SELECT start,end,active_path,active_digest FROM buckets WHERE active_path IS NOT NULL")}
+        known = {row["start"]: dict(row) for row in self.connection.execute("SELECT * FROM quality_snapshots")}
+        segments = []
+        for start in sorted(active.keys() | known.keys()):
+            bucket, cached = active.get(start), known.get(start)
+            if bucket is None:
+                record = dict(cached)
+                record["last_error"] = "Quality checkpoint has no corresponding active ledger row"
+            else:
+                unchanged = cached and cached["active_path"] == bucket["active_path"] and cached["active_digest"] == bucket["active_digest"]
+                record = self._quality_record(start, bucket["end"], bucket["active_path"], bucket["active_digest"], expected=cached if unchanged else None)
+            if record != cached:
+                self._save_quality_record(record)
+            state = "unknown" if record["last_error"] or record["quality"] is None else "problem" if record["quality"] else None
+            if state:
+                segments.append({"start": _iso(start), "end": _iso(record["end"]), "state": state, "digest": record["active_digest"]})
+        self.connection.commit()
+        return {"problem_segments": sum(segment["state"] == "problem" for segment in segments),
+                "unknown_segments": sum(segment["state"] == "unknown" for segment in segments),
+                "fingerprint": hashlib.sha256(_canonical(segments).encode()).hexdigest(), "segments": segments}
 
     def pending_alerts(self):
         return [dict(row) for row in self.connection.execute("SELECT * FROM alerts WHERE status='pending' ORDER BY created_at,id")]
@@ -315,6 +401,7 @@ class CacheStore:
                     previous = dict(self.connection.execute("SELECT * FROM buckets WHERE start=?", (start,)).fetchone())
                     refresh_done = bool(original["active_path"]) or stamp - end >= 2 * 3600
                     self.connection.execute("UPDATE buckets SET status='succeeded',active_path=?,active_digest=?,last_success=?,last_error=NULL,next_retry=0,refresh_done=?,failure_cycles=0,incident_open=0 WHERE start=?", (relative, digest, stamp, int(refresh_done), start))
+                    self._save_quality_record(self._quality_record(start, end, relative, digest))
                     if previous["incident_open"]:
                         self.connection.execute("UPDATE alerts SET status='cancelled' WHERE bucket_start=? AND generation=? AND status='pending'", (start, previous["incident_generation"]))
                         self._queue(previous, "recovered", stamp)
