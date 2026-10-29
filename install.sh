@@ -13,6 +13,7 @@ usage() {
   --regions REGIONS     all 或逗号分隔区域；新安装默认 all
   --publish-dir PATH    可选 HTML 网页副本目录；默认不发布网页
   --minute 05|10        北京时间执行分钟；新安装默认 10（08:10）
+  --interval-minutes 30|60  增量分段分钟数；默认30，采集器每5分钟检查到期段和失败重试
   --no-enable           安装并预检，但不启用定时器
   --check-only          只检查已部署环境和配置，不安装软件、不写文件、不启停服务
   --help                显示帮助
@@ -30,6 +31,7 @@ PROFILE=''
 REGIONS=''
 PUBLISH_DIR=''
 MINUTE=''
+INTERVAL=''
 PROFILE_SET=0
 REGIONS_SET=0
 PUBLISH_SET=0
@@ -38,7 +40,7 @@ NO_ENABLE=0
 ORIGINAL_ARGS=("$@")
 while (($#)); do
   case "$1" in
-    --user|--profile|--regions|--publish-dir|--minute)
+    --user|--profile|--regions|--publish-dir|--minute|--interval-minutes)
       (($# >= 2)) || fail "$1 缺少值"
       [[ -n "$2" && "$2" != --* ]] || fail "$1 缺少值"
       case "$1" in
@@ -47,6 +49,7 @@ while (($#)); do
         --regions) REGIONS="$2"; REGIONS_SET=1 ;;
         --publish-dir) PUBLISH_DIR="$2"; PUBLISH_SET=1 ;;
         --minute) MINUTE="$2" ;;
+        --interval-minutes) INTERVAL="$2" ;;
       esac
       shift 2 ;;
     --no-enable) NO_ENABLE=1; shift ;;
@@ -56,8 +59,8 @@ while (($#)); do
   esac
 done
 
-if ((CHECK_ONLY && (PROFILE_SET || REGIONS_SET || PUBLISH_SET))) || [[ "$CHECK_ONLY" == 1 && -n "$MINUTE" ]]; then
-  fail '--check-only 使用现有环境配置，不能同时指定 profile、regions、publish-dir 或 minute 修改项。'
+if ((CHECK_ONLY && (PROFILE_SET || REGIONS_SET || PUBLISH_SET))) || [[ "$CHECK_ONLY" == 1 && ( -n "$MINUTE" || -n "$INTERVAL" ) ]]; then
+  fail '--check-only 使用现有环境配置，不能同时指定 profile、regions、publish-dir、minute 或 interval-minutes 修改项。'
 fi
 
 [[ "$(uname -s)" == Linux ]] || fail 'install.sh 只适用于 Linux；Windows 请使用 Python 脚本或 Linux 服务器部署。'
@@ -68,7 +71,7 @@ if ((EUID != 0)); then
   exec sudo -- bash "$PROJECT_ROOT/install.sh" "${ORIGINAL_ARGS[@]}"
 fi
 [[ "$PROJECT_ROOT" != *$'\n'* && "$PROJECT_ROOT" != *$'\r'* ]] || fail '项目路径不能包含换行。'
-for name in rds_audit.py rds_report.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer; do
+for name in rds_audit.py rds_report.py rds_change_filter.py rds_report_pages.py rds_cache.py rds_jobs.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/run_collect.py deploy/run_failure.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer deploy/aws-rds-audit-collect.service deploy/aws-rds-audit-collect.timer deploy/aws-rds-audit-failure@.service; do
   [[ -f "$PROJECT_ROOT/$name" ]] || fail "项目缺少文件：$name，请先下载完整项目。"
 done
 ENV_FILE=/etc/aws-rds-audit.env
@@ -157,6 +160,7 @@ RUN_USER="${RUN_USER:-${SUDO_USER:-root}}"
 id "$RUN_USER" >/dev/null 2>&1 || fail "运行用户不存在：$RUN_USER"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 [[ -z "$MINUTE" || "$MINUTE" == 05 || "$MINUTE" == 10 ]] || fail '--minute 只能是 05 或 10。'
+[[ -z "$INTERVAL" || "$INTERVAL" == 30 || "$INTERVAL" == 60 ]] || fail '--interval-minutes 只能是 30 或 60。'
 if ((PUBLISH_SET)); then [[ "$PUBLISH_DIR" == /* ]] || fail '--publish-dir 必须是绝对路径。'; fi
 
 if ((CHECK_ONLY)); then
@@ -168,7 +172,7 @@ else
   fi
   install -d -m 0750 -o "$RUN_USER" -g "$RUN_GROUP" "$PROJECT_ROOT/reports"
   # Parse existing EnvironmentFile as data, retaining comments/private settings.
-  "$VENV/bin/python" - "$PROJECT_ROOT" "$ENV_FILE" "$RUN_USER" "$RUN_GROUP" "$PROFILE_SET" "$PROFILE" "$REGIONS_SET" "$REGIONS" "$PUBLISH_SET" "$PUBLISH_DIR" "$MINUTE" <<'PY'
+  "$VENV/bin/python" - "$PROJECT_ROOT" "$ENV_FILE" "$RUN_USER" "$RUN_GROUP" "$PROFILE_SET" "$PROFILE" "$REGIONS_SET" "$REGIONS" "$PUBLISH_SET" "$PUBLISH_DIR" "$MINUTE" "$INTERVAL" <<'PY'
 import json
 import os
 import pwd
@@ -176,7 +180,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-root, destination, username, group, profile_set, profile, regions_set, regions, publish_set, publish, minute = sys.argv[1:]
+root, destination, username, group, profile_set, profile, regions_set, regions, publish_set, publish, minute, interval = sys.argv[1:]
 sys.path.insert(0, str(Path(root) / 'deploy'))
 from run_daily import load_environment
 from render_units import write_units
@@ -186,6 +190,8 @@ updates = {'AWS_RDS_RUN_USER': username}
 defaults = {
     'AWS_RDS_REGIONS': 'all', 'AWS_RDS_REPORT_ROOT': str(Path(root) / 'reports'),
     'AWS_RDS_LARK_CONFIG': str(Path(root) / 'lark-config.json'), 'AWS_RDS_MINUTE': '10',
+    'AWS_RDS_CACHE_DIR': str(Path(root) / 'cache'), 'AWS_RDS_INTERVAL_MINUTES': '30',
+    'AWS_RDS_CACHE_LOOKBACK_HOURS': '26', 'AWS_RDS_MAX_BUCKETS_PER_RUN': '6',
 }
 for key, value in defaults.items():
     if key not in existing:
@@ -194,6 +200,7 @@ if profile_set == '1': updates['AWS_PROFILE'] = profile
 if regions_set == '1': updates['AWS_RDS_REGIONS'] = regions
 if publish_set == '1': updates['AWS_RDS_PUBLISH_DIR'] = publish
 if minute: updates['AWS_RDS_MINUTE'] = minute
+if interval: updates['AWS_RDS_INTERVAL_MINUTES'] = interval
 content = env_path.read_text(encoding='utf-8-sig') if env_path.exists() else '# RDS audit service environment; single-line KEY="value" settings. Never source this file in a shell.\n'
 lines = [line for line in content.splitlines() if line.partition('=')[0].strip() not in updates]
 lines += [key + '=' + json.dumps(value, ensure_ascii=False) for key, value in updates.items()]
@@ -207,9 +214,24 @@ effective = load_environment(env_path)
 run_minute = effective.get('AWS_RDS_MINUTE', '10')
 if run_minute not in {'05', '10'}:
     raise ValueError('AWS_RDS_MINUTE must be 05 or 10')
+if effective.get('AWS_RDS_INTERVAL_MINUTES') not in {'30', '60'}:
+    raise ValueError('AWS_RDS_INTERVAL_MINUTES must be 30 or 60')
+for key, maximum in (('AWS_RDS_CACHE_LOOKBACK_HOURS', 2136), ('AWS_RDS_MAX_BUCKETS_PER_RUN', 100)):
+    value = effective.get(key, '')
+    if not value.isdecimal() or not 1 <= int(value) <= maximum:
+        raise ValueError(key + ' is outside the supported range')
+cache = Path(effective['AWS_RDS_CACHE_DIR'])
+if not cache.is_absolute() or cache.is_symlink():
+    raise ValueError('AWS_RDS_CACHE_DIR must be an absolute directory, not a symlink')
+if not cache.exists():
+    cache.mkdir(parents=True, mode=0o750)
+    cache.chmod(0o750)
+    os.chown(cache, account.pw_uid, account.pw_gid)
+elif not cache.is_dir():
+    raise ValueError('AWS_RDS_CACHE_DIR is not a directory')
 write_units(Path('/etc/systemd/system'), root, username, group, account.pw_dir, minute=run_minute)
 PY
-  systemd-analyze verify /etc/systemd/system/aws-rds-audit.service /etc/systemd/system/aws-rds-audit.timer || fail '生成的 systemd 服务校验失败。'
+  systemd-analyze verify /etc/systemd/system/aws-rds-audit.service /etc/systemd/system/aws-rds-audit.timer /etc/systemd/system/aws-rds-audit-collect.service /etc/systemd/system/aws-rds-audit-collect.timer /etc/systemd/system/aws-rds-audit-failure@.service || fail '生成的 systemd 服务校验失败。'
   systemctl daemon-reload
 fi
 
@@ -220,7 +242,7 @@ if command -v timedatectl >/dev/null && [[ "$(timedatectl show -p NTPSynchronize
 fi
 if ! "$VENV/bin/python" "$PROJECT_ROOT/deploy/run_daily.py" --env-file "$ENV_FILE" --as-user "$RUN_USER" --check-config; then
   if ((CHECK_ONLY == 0)); then
-    systemctl disable --now aws-rds-audit.timer || true
+    systemctl disable --now aws-rds-audit.timer aws-rds-audit-collect.timer || true
   fi
   printf '[待配置] 部署文件已保留，定时器未启用。请按上方提示配置服务用户的 AWS 身份、只读权限和真实 Lark Webhook，再重新运行 install.sh。\n' >&2
   printf 'Lark 配置：%s/lark-config.json；服务环境：%s（不要将私有配置提交到 Git）。\n' "$PROJECT_ROOT" "$ENV_FILE" >&2
@@ -231,8 +253,9 @@ if ((CHECK_ONLY)); then
 elif ((NO_ENABLE)); then
   log '安装和预检完成；按 --no-enable 要求未启用定时器。'
 else
-  systemctl enable --now aws-rds-audit.timer
-  systemctl list-timers aws-rds-audit.timer --no-pager
-  log '部署完成。定时器按 Asia/Shanghai 运行，服务器本地时区无需修改。'
+  systemctl enable --now aws-rds-audit-collect.timer aws-rds-audit.timer
+  systemctl list-timers aws-rds-audit-collect.timer aws-rds-audit.timer --no-pager
+  log '部署完成。分段默认30分钟，采集器每5分钟检查到期分段/失败补采；日报按 Asia/Shanghai 08:10（或08:05）仅汇总本地缓存。'
 fi
 printf '查看日志：journalctl -u aws-rds-audit.service -n 100 --no-pager\n'
+printf '采集与重试日志：journalctl -u aws-rds-audit-collect.service -n 100 --no-pager\n'

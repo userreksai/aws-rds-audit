@@ -136,9 +136,10 @@ class ManagementHistoryTests(unittest.TestCase):
             output, counts = io.StringIO(), summary()
             c.management_events(REGION, output, counts)
             result = [json.loads(line) for line in output.getvalue().splitlines()]
-            self.assertEqual([row["event"]["eventID"] for row in result], ["read", "write"])
-            self.assertEqual(result[1]["event"]["requestParameters"]["dBInstanceIdentifier"], "deleted-db")
-            self.assertEqual(counts["management_event_count"], 2)
+            self.assertEqual([row["event"]["eventID"] for row in result], ["write"])
+            self.assertEqual(result[0]["event"]["requestParameters"]["dBInstanceIdentifier"], "deleted-db")
+            self.assertEqual(counts["management_event_count"], 1)
+            self.assertEqual(counts["filtered_management_event_count"], 1)
             stub.assert_no_pending_responses()
 
 
@@ -169,11 +170,36 @@ class InstanceLogTests(unittest.TestCase):
 
 
 class CloudWatchTests(unittest.TestCase):
+    def test_mixed_envelope_excludes_query_before_disk_and_preserves_source_indexes(self):
+        import rds_report
+        client = Mock()
+        group = "/aws/rds/cluster/example/audit"
+        client.describe_log_groups.return_value = {"logGroups": [{"logGroupName": group}]}
+        statements = [("SELECT private_read_value FROM example", 0), ("INSERT INTO example VALUES (1)", 0), ("DELETE FROM example WHERE x=2", 1142)]
+        message = "\n".join(f"{int(START.timestamp()*1000000)},server,user,203.0.113.1,1,{index},QUERY,db,'{sql}',{code}" for index, (sql, code) in enumerate(statements))
+        client.filter_log_events.return_value = {"events": [{"eventId": "mixed", "timestamp": int(START.timestamp()*1000), "message": message, "logStreamName": "example"}]}
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            c = collector(root, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
+            counts = summary()
+            c.cloudwatch(REGION, counts)
+            saved = next((root / "cloudwatch").glob("*.jsonl")).read_text(encoding="utf-8")
+            self.assertNotIn("private_read_value", saved)
+            self.assertEqual(json.loads(saved)["original_record_indexes"], [1, 2])
+            c.report.update(collection_status="ok", regions={REGION: counts}, sql_log_download_requested=True)
+            (root / "report.json").write_text(json.dumps(c.report), encoding="utf-8")
+            (root / "management-events.jsonl").write_text("", encoding="utf-8")
+            report = rds_report.build_daily_report(root, audit_date="2026-10-28", start=START, end=END, period_kind="custom")
+            self.assertEqual({row["event_id"] for row in report["events"]}, {"mixed:1", "mixed:2"})
+            self.assertEqual(report["metadata"]["counts"]["新增"], 1)
+            self.assertEqual(report["metadata"]["counts"]["删除"], 0)
+            self.assertEqual(report["metadata"]["failed_or_partial"], 1)
+
     def test_hong_kong_download_reports_window_count_without_exposing_sql(self):
         client = Mock()
         group = "/aws/rds/cluster/shenji/audit"
         client.describe_log_groups.return_value = {"logGroups": [{"logGroupName": group}, {"logGroupName": "/aws/rds/cluster/shenji/error"}, {"logGroupName": "RDSOSMetrics"}]}
-        client.filter_log_events.return_value = {"events": [{"eventId": "hk-1", "timestamp": int(START.timestamp() * 1000), "message": "UPDATE private_business_value", "logStreamName": "shenji-1"}]}
+        client.filter_log_events.return_value = {"events": [{"eventId": "hk-1", "timestamp": int(START.timestamp() * 1000), "message": f"{int(START.timestamp()*1000000)},server,user,203.0.113.1,1,1,QUERY,db,'UPDATE private_business_value SET x=1',0", "logStreamName": "shenji-1"}]}
         with tempfile.TemporaryDirectory() as directory:
             c = collector(directory, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
             counts, output = summary(), io.StringIO()
@@ -181,7 +207,7 @@ class CloudWatchTests(unittest.TestCase):
                 c.cloudwatch("ap-east-1", counts)
             self.assertEqual(len(counts["sql_log_groups"]), 1)
             self.assertEqual(counts["sql_log_groups"][0]["download"]["event_count"], 1)
-            self.assertIn("已下载 1 条 CloudWatch 日志事件", output.getvalue())
+            self.assertIn("保留含增删改事件 1 条", output.getvalue())
             self.assertNotIn("private_business_value", output.getvalue())
             client.filter_log_events.assert_called_once()
 
@@ -190,7 +216,7 @@ class CloudWatchTests(unittest.TestCase):
         group = "/aws/rds/cluster/deleted-cluster/audit"
         base_request = {"logGroupName": group, "startTime": int(START.timestamp() * 1000), "endTime": int(END.timestamp() * 1000)}
         messages = ["Execute stmt-123", "CALL change_balance(42)", "UPDATE users\nSET name='中文' WHERE id=1"]
-        events = [{"eventId": str(index), "timestamp": int((START + timedelta(minutes=index)).timestamp() * 1000), "message": message, "logStreamName": "old-reader"} for index, message in enumerate(messages)]
+        events = [{"eventId": str(index), "timestamp": int((START + timedelta(minutes=index)).timestamp() * 1000), "message": f"{int((START+timedelta(minutes=index)).timestamp()*1000000)},server,user,203.0.113.1,1,{index},QUERY,db,'{message}',0", "logStreamName": "old-reader"} for index, message in enumerate(messages)]
         events.append({"eventId": "end", "timestamp": int(END.timestamp() * 1000), "message": "not in requested window", "logStreamName": "old-reader"})
         with tempfile.TemporaryDirectory() as directory, Stubber(client) as stub:
             stub.add_response("describe_log_groups", {"logGroups": [{"logGroupName": group, "retentionInDays": 30}]}, {"logGroupNamePrefix": "/aws/rds/"})
@@ -202,15 +228,17 @@ class CloudWatchTests(unittest.TestCase):
             item = counts["sql_log_groups"][0]
             output = Path(directory) / item["download"]["path"]
             result = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([row["message"] for row in result], messages)
-            self.assertEqual(item["download"]["event_count"], 3)
+            self.assertEqual([row["message"] for row in result], [events[2]["message"]])
+            self.assertEqual(item["download"]["event_count"], 1)
+            self.assertEqual(item["download"]["quarantined_record_count"], 2)
+            self.assertTrue((Path(directory) / "quarantine/sql-unclassified.jsonl").is_file())
             self.assertEqual(item["download"]["status"], "ok")
             self.assertEqual(counts["instances"], [])
             stub.assert_no_pending_responses()
 
     def test_group_download_failure_does_not_hide_other_groups(self):
         client = Mock()
-        first, second = "/aws/rds/instance/a/audit", "/aws/rds/instance/b/general"
+        first, second = "/aws/rds/instance/a/audit", "/aws/rds/instance/b/audit"
         client.describe_log_groups.return_value = {"logGroups": [{"logGroupName": first}, {"logGroupName": second}]}
         client.filter_log_events.side_effect = [ClientError({"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "FilterLogEvents"), {"events": []}]
         with tempfile.TemporaryDirectory() as directory:
@@ -220,6 +248,17 @@ class CloudWatchTests(unittest.TestCase):
                 c.cloudwatch(REGION, counts)
             self.assertEqual([item["download"]["status"] for item in counts["sql_log_groups"]], ["error", "ok"])
             self.assertEqual(c.report["checks"][0]["status"], "error")
+
+    def test_general_logs_are_listed_without_fetching_query_bodies(self):
+        client = Mock()
+        client.describe_log_groups.return_value = {"logGroups": [{"logGroupName": "/aws/rds/cluster/example/general"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            c = collector(directory, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
+            counts = summary()
+            with redirect_stdout(io.StringIO()):
+                c.cloudwatch(REGION, counts)
+            self.assertEqual(counts["sql_log_groups"][0]["download"]["status"], "skipped_read_logs")
+            client.filter_log_events.assert_not_called()
 
 
 class CoverageTests(unittest.TestCase):

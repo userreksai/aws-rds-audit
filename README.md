@@ -1,218 +1,188 @@
-# AWS RDS 操作审计日报
+# AWS RDS 增删改审计日报
 
-采集当前 AWS 账号可见的 RDS 操作，生成中文 HTML 日报：先看新增、删除、修改数量，再按操作者查看汇总和具体操作。报告区分 RDS 管理 API 与数据库内部 SQL，不会将数据库账号猜测为真实人员。可将数量汇总发送到 Lark / 飞书群机器人。
+采集当前 AWS 账号可见的 RDS 管理变更与 MySQL / Aurora MySQL SQL 增删改，生成中文 HTML 报告，并向 Lark / 飞书发送数量汇总。先看新增、删除、修改，再按 AWS 身份或数据库账号查看操作；数据库账号不等于真实人员姓名。
 
-日报固定使用北京时间（Asia/Shanghai）：**前一日 07:00 至当日 08:00，共 25 小时**；每天 **08:10** 由 systemd timer 执行。相邻两天报告有意重叠 07:00 至 08:00 的一小时，不能直接将多天总数相加作为去重统计。查询使用左闭右开窗口，08:00 整的记录由之后覆盖该时刻的窗口收录。
+推荐部署方式为**每 30 分钟分段采集、每天本地汇总**，避免每天重新拉取整个窗口。日报固定为北京时间（Asia/Shanghai）**前一日 07:00 至当日 08:00，共 25 小时**，每天 **08:10** 执行，可改 08:05。相邻日报有意重叠一小时，不能直接将多天数量相加作为去重统计。窗口左闭右开。
 
-自定义时间窗口也会自动生成 HTML：`--days`、`--start` / `--end` 或默认最近 7 天采集结束后，输出按真实窗口汇总的报告，不需要再加 `--daily`。已有下载目录可直接离线生成 HTML，无需重新请求 AWS 或重新下载日志。
+## 数据与统计口径
 
-## 记录与计数
-
-| 数据来源 | 报告内容 | 计数边界 |
+| 来源 | 保留内容 | 排除或限制 |
 | --- | --- | --- |
-| CloudTrail RDS 管理事件 | AWS 身份、角色会话、时间、来源 IP、API、请求参数及结果 | 查询近 90 天；读取 API 保留在其他操作，失败请求单列，不算成功返回的增删改 |
-| MySQL / Aurora MySQL audit 日志 | 数据库账号、来源、数据库、SQL、返回码及日志位置 | 必须当时已开启审计且日志仍保留；按可可靠识别的语句归类 |
-| general 日志与 RDS 服务事件 | 原始采集文件和覆盖范围说明 | 不与 audit 日志混在一起重复计算 SQL 变更 |
+| CloudTrail RDS 管理事件 | 可明确归类为新增、删除、修改的管理 API，包含失败请求 | 排除读取 API 和其他非增删改 API；近 90 天可查 |
+| CloudWatch audit 日志 | 可明确归类的 SQL 变更，包含失败语句、DDL、REPLACE、LOAD DATA 等 | 排除 SELECT、SHOW、DESC、EXPLAIN 及连接、表访问等辅助事件；INSERT … SELECT 等写入仍保留 |
+| general 日志 | 现存目录与配置 | 常规采集不下载正文，不重复计算 SQL |
+| RDS 服务事件 | 原始归档中的服务通知与覆盖说明 | 不混入人员操作的增删改计数 |
 
-HTML 同时显示 API 与 SQL 分来源统计。它统计日志中的操作记录，不等于受影响行数；SQL 返回码为 0 不证明事务最终 COMMIT，API 调用成功也不证明异步资源变更已完成。CALL、复杂语句或不能可靠分类的内容保留在其他操作供核查。
+增删改数量按**未报错的请求或语句条数**统计；失败的增删改保留在失败数和明细，不计入成功数量。它不是受影响行数；SQL 返回码 0 不证明事务最终提交，API 未报错不证明异步变更已经完成。
 
-CloudTrail 不包含普通 MySQL 客户端执行的表内增删改。普通 RDS MySQL 使用 MARIADB_AUDIT_PLUGIN，Aurora MySQL 使用 Advanced Auditing；没开过的审计、已删除的日志、被排除的用户或被截断的 SQL，不能事后补出完整历史。详细配置区别、原始采集参数与官方来源见 [RDS_AUDIT.md](RDS_AUDIT.md)。
+采集器逐页读取 audit 候选事件，**写入归档前过滤查询**；同一 CloudWatch 事件混有查询和变更时，只保存变更原文片段及原始记录位置。无法分类、格式异常或疑似截断的记录进入 `quarantine/sql-unclassified.jsonl`，不猜测为查询，不混入统计，报告标记不完整。过滤减少本地归档和报告体积；AWS 源日志量与候选事件下载流量仍取决于数据库审计配置。
 
-## 部署前准备
+CloudTrail 不记录普通 MySQL 客户端的表内增删改，必须当时已启用 audit 且日志仍在保留期内。未记录的历史不能补录。引擎配置、IAM 与证据边界见 [RDS_AUDIT.md](RDS_AUDIT.md)。
 
-安装脚本面向 Linux + systemd，使用独立 Python 虚拟环境。需要可访问操作系统软件源、Python 包源及 AWS API。脚本可安装缺少的系统包和 Python 模块，但不会生成 AWS 凭据、授予 IAM 权限、创建 Lark 机器人或自动启用数据库审计。
+## 服务器部署与更新
 
-1. 下载代码到部署目录，例如 /opt/aws-rds-audit。
-2. 将 [iam-policy-rds-audit.json](iam-policy-rds-audit.json) 挂到运行采集的 IAM 角色或身份。它仅包含本项目使用的读取权限，不允许修改 RDS 配置。
-3. 以服务实际运行的操作系统用户配置 AWS 身份。EC2 IAM Role 推荐省略 profile；已有本地 profile 可使用 audit。不要把 Access Key 或数据库密码写进代码。
-4. 在项目目录创建自己的 lark-config.json，配置目标群机器人 Webhook。实际文件被 Git 忽略，安装或更新不会覆盖已有配置。
+安装器支持 Linux + systemd，使用项目 `.venv`。它检查运行用户、Python 3.10+、venv、pip、依赖模块、systemd 配置和现有 AWS 资源读取权限，可从系统软件源安装缺少组件。服务器需能访问系统源、Python 包源和 AWS API；脚本不会创建 AWS 凭据、授予 IAM 权限或开启数据库审计。
 
-Lark 配置示例：
+部署目录为 `/usr/local/aws-rds-shenji`。目录已创建且为空时拉取：
+
+~~~bash
+git clone https://github.com/userreksai/aws-rds-audit.git /usr/local/aws-rds-shenji
+cd /usr/local/aws-rds-shenji
+~~~
+
+将 [iam-policy-rds-audit.json](iam-policy-rds-audit.json) 配置给采集身份，并以服务用户配置 AWS profile `audit`。EC2 IAM Role 可省略 profile，使用默认凭据链。不要将密钥写进代码。
+
+仅首次创建 Lark 配置时执行，再填写自己的 Webhook 和可选签名密钥：
 
 ~~~bash
 cp lark-config.example.json lark-config.json
 chmod 600 lark-config.json
 ~~~
 
-仅首次创建时复制；已有配置请直接编辑。report_url_template 可填写实际可访问的报告地址，支持 {date}、{account_id}、{filename}；没有发布网站时留空。不要沿用其他项目的地址。Webhook 和签名密钥保留在本机私有文件，勿提交到 Git。
+已有私有配置直接保留。`report_url_template` 支持 `{date}`、`{account_id}`、`{filename}`，没有报告网站时留空。私有配置被 Git 忽略，勿提交凭据或 Webhook。
 
-## 安装与定时服务
-
-在项目目录执行：
+安装或更新：
 
 ~~~bash
-sudo bash install.sh
-~~~
-
-使用名为 audit 的 AWS profile，并明确服务运行用户时：
-
-~~~bash
-sudo bash install.sh --user ubuntu --profile audit --regions all
-~~~
-
-将 ubuntu 替换为实际配置 AWS 身份的本机用户；直接以 root 安装且没有指定用户时使用 root，通过 sudo 安装时默认使用原调用用户。服务使用该用户的 HOME，不会自动将 root 的凭据复制给其他用户。
-
-安装器会检查 Linux/systemd、Python 版本、venv、pip、依赖模块和运行用户，安装可从系统软件源获得的缺少组件，并通过主程序预检 AWS 访问及 Lark 配置。预检不发送消息；真实凭据、授权或配置缺失时会给出错误，保留安装结果，不启动未通过检查的定时任务。修正后重跑安装器即可。
-
-如果旧版安装提示 `WorkingDirectory= path is not absolute` 且路径外带双引号，更新代码后直接重新执行安装命令即可重新生成服务文件，无需删除 `.venv` 或私有配置。例如部署目录为 `/usr/local/aws-rds-shenji` 时：
-
-```bash
 cd /usr/local/aws-rds-shenji
 git pull --ff-only origin main
-bash install.sh --user root --profile audit --regions all --minute 10
-```
+bash install.sh --user root --profile audit --regions all --minute 10 --interval-minutes 30
+systemctl start aws-rds-audit-collect.service
+systemctl list-timers 'aws-rds-audit*' --no-pager
+~~~
 
-服务生成器分别处理 `WorkingDirectory` 路径标量与 `ExecStart` / `Environment` 的引用规则。普通路径及含内部空格、Unicode、百分号的路径受支持；包含 `$`、控制字符、引号、反斜线、通配符起始字符或以空白结尾的项目目录会明确拒绝，避免生成无法启动的服务。
+**升级后须重跑 install.sh**，以创建增量定时器并将每日服务改为读取缓存；只执行 git pull 不会更新已安装的 systemd 单元。安装保留已有虚拟环境、AWS 配置及私有 Lark 配置。旧版 `WorkingDirectory= path is not absolute` 错误也通过重新生成单元修复。
 
-| 安装参数 | 用途 |
+首次每轮最多处理 6 段，随后每 5 分钟继续回填。立即启动采集不代表已补齐 25 小时；日报会显示缺段，不能把不完整状态当作没有操作。
+
+| 安装参数 | 说明 |
 | --- | --- |
-| --user USER | 指定已有的服务运行用户 |
-| --profile NAME | 设置 AWS profile；实例角色方式省略 |
-| --regions all 或区域列表 | 默认所有已启用区域；多个区域用逗号分隔 |
-| --publish-dir /绝对路径 | 可选的 HTML 网页副本目录；默认不发布网页 |
-| --minute 05 或 10 | 北京时间 08:05 或 08:10；新安装默认 08:10 |
-| --no-enable | 安装并预检，但不主动启用定时器；已有定时器不会因此被关闭 |
-| --check-only | 检查已保存的部署配置，不安装、不写文件、不启停服务；不能同时指定 profile、regions、publish-dir 或 minute 修改项 |
+| `--user USER` | 已存在的服务用户，应能读取其 AWS 配置和项目 |
+| `--profile NAME` | AWS profile；实例角色方式省略 |
+| `--regions all` 或逗号分隔列表 | 默认所有已启用区域 |
+| `--interval-minutes 30\|60` | 分段长度，默认 30 分钟 |
+| `--minute 05\|10` | 北京时间 08:05 或 08:10，默认 08:10 |
+| `--publish-dir /绝对路径` | 可选网页发布目录 |
+| `--no-enable` | 安装并预检，不主动启用定时器 |
+| `--check-only` | 检查现有配置，不安装、不写文件、不启停服务；不与配置修改参数混用 |
 
-服务配置保存为 /etc/aws-rds-audit.env，由 root 所有、权限 0600。配置缺失或预检失败时安装器退出 2 并禁用定时器；修正配置后再次运行安装命令。安装器保留已有私有配置，不删除现有虚拟环境。
+服务使用指定用户的 HOME，不会把 root 的凭据复制给其他用户。预检失败时保留安装结果并禁用两个定时器；修正后重跑。预检不保存业务日志、不发送 Lark，不能证明真实 Webhook 可用或未来资源权限充足。
 
-环境文件使用单行 KEY="value" 格式，支持 AWS 标准凭据链配置，例如 AWS_PROFILE、AWS_DEFAULT_REGION、AWS_SHARED_CREDENTIALS_FILE；项目配置包括 AWS_RDS_REGIONS、AWS_RDS_REPORT_ROOT、AWS_RDS_LARK_CONFIG、AWS_RDS_PUBLISH_DIR、AWS_RDS_MINUTE。更改执行分钟应重跑安装器，以便同步生成的 timer。凭据文件仍须由服务用户可读，环境文件不会绕过 AWS 授权。
+配置文件 `/etc/aws-rds-audit.env` 由 root 所有、权限 0600，支持标准 AWS 凭据链变量。主要项目配置：
 
-定时器使用明确的 Asia/Shanghai，无需更改服务器的系统时区。Persistent=true 会在停机错过执行时补触发；运行器选择最近已结束的日报窗口，避免北京时间 08:00 前查询尚未结束的当天窗口，并使用文件锁避免同一服务并发采集。
+| 环境变量 | 默认值或用途 |
+| --- | --- |
+| `AWS_RDS_CACHE_DIR` | 项目下 cache，新建目录归服务用户、权限 0750 |
+| `AWS_RDS_INTERVAL_MINUTES` | 30 |
+| `AWS_RDS_CACHE_LOOKBACK_HOURS` | 26，新发现分段的回看小时数 |
+| `AWS_RDS_MAX_BUCKETS_PER_RUN` | 6，每轮处理上限 |
+| `AWS_RDS_REGIONS` | all |
+| `AWS_RDS_REPORT_ROOT` | 项目下 reports |
+| `AWS_RDS_LARK_CONFIG` | 项目私有 lark-config.json |
+| `AWS_RDS_PUBLISH_DIR` | 可选发布目录 |
+| `AWS_RDS_MINUTE` | 10；变更后重跑安装器同步 timer |
 
-支持的安装参数以 bash install.sh --help 为准。部署后检查：
+## 分段、重试与告警
+
+`aws-rds-audit-collect.timer` 每 5 分钟检查到期工作，数据按 30 或 60 分钟已结束窗口采集，并留 5 分钟发布缓冲，**不是每 5 分钟重拉全部日志**。每段有 SQLite 检查点、独立尝试目录和内容校验，进程锁防止并发。账号、profile、区域、分段长度与过滤版本隔离，改变配置会使用不同缓存范围。
+
+失败段最多立即尝试 3 次，间隔 2、4 秒；仍失败则保留状态，后续从 5 分钟起退避至最多 1 小时重试。已发现的失败或待采段即使超出 26 小时回看范围仍会补采，最多近 89 天安全范围。成功段通常不重复下载，但结束约 60 分钟后额外复采一次，以补收延迟日志。源日志已删除或更迟发布的内容仍可能无法恢复。
+
+读取成功但含未知 SQL 时，保存快照和质量不完整标记，不因同一质量问题无限重复下载。日报校验状态和快照，缺失、失败、损坏段标记不完整并加入补采队列，**不能当作 0 条**。25 小时日报需要 50 个半小时段，或 25 个一小时段。
+
+采集失败、日报缺段、解析质量、发布/通知失败记录持久化告警，向 Lark 提醒并在恢复后通知。同一故障每小时最多提醒一次；Webhook 失败留待发送记录并重试。进程异常退出或超时也有 systemd `OnFailure` 告警入口。网络超时可能表示已投递但未确认，重试有可能出现相同事件编号的重复通知。Webhook 不可用时先查看本地日志，恢复后继续投递。
+
+每日 `aws-rds-audit.timer` 只汇总本地成功分段，不发起 25 小时 AWS 全量查询。已发送的当日日报若收到窗口内分段恢复或延迟数据，会自动修订并注明；内容未改变不会自动重复发送。当日 08:00 后的新分段不会无故修订已结束窗口。历史日期不自动逐日重发，可显式补报。
+
+采集和汇总共用进程锁，避免同时更新检查点与日报。日报遇到采集占用会持久化排队，首次生成异常也会保留重试请求，由后续定时任务继续处理。缓存、失败尝试和历史报告不会自动删除；请按服务器容量安排受控归档与保留期，勿删除尚待补采或当日日报依赖的缓存。
 
 ~~~bash
-systemctl status aws-rds-audit.timer
-systemctl list-timers aws-rds-audit.timer
+journalctl -u aws-rds-audit-collect.service -n 100 --no-pager
 journalctl -u aws-rds-audit.service -n 100 --no-pager
+systemctl status aws-rds-audit-collect.timer aws-rds-audit.timer
 ~~~
 
-手动运行服务会进行真实 AWS 采集，并在启用通知时发送 Lark：
+定时器使用 Asia/Shanghai，无需改服务器时区。`Persistent=true` 在停机错过触发时补执行；日报选最近已结束窗口，更早日期手动补报。刚安装时 `LAST -`、`No entries` 通常表示正式服务还未执行。
 
-~~~bash
-sudo systemctl start aws-rds-audit.service
-~~~
+## 手动运行
 
-运行器会跳过本机以相同运行配置成功完成的同一日报日期，防止重复通知；更换 profile、发布目录等配置后可以重新执行。若需要有意重跑、补采或再次通知，使用下方主程序的显式日期命令；重新加 --send-lark 会再次发送。停机多天后的持久化触发只补最近一个已结束窗口，不自动遍历所有缺失日期；更早日期需手动补跑。
-
-## 手动运行与预检
-
-在没有安装 systemd 服务的本地环境中，可以手动创建虚拟环境。需要 Python 3.10 或更高版本：
+未安装服务时先创建虚拟环境并预检：
 
 ~~~bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python rds_audit.py --check-config --profile audit --regions all --send-lark --lark-config lark-config.json
 ~~~
 
-先做不发送消息的配置检查：
+手动采集到与安装器一致的 cache 目录：
 
 ~~~bash
-.venv/bin/python rds_audit.py --check-config --profile audit --regions all \
+.venv/bin/python rds_audit.py --collect-incremental --profile audit --regions all \
+  --cache-dir cache --interval-minutes 30 --cache-lookback-hours 26 --max-buckets-per-run 6 \
   --send-lark --lark-config lark-config.json
 ~~~
 
-生成北京时间今天的日报并发送汇总：
+从缓存生成日报；可加 `--date 2026-10-29` 补报指定结束日期：
 
 ~~~bash
-.venv/bin/python rds_audit.py --daily --profile audit --regions all \
-  --output-dir reports --send-lark --lark-config lark-config.json
+.venv/bin/python rds_audit.py --daily --from-cache --profile audit --regions all \
+  --cache-dir cache --interval-minutes 30 --output-dir reports \
+  --send-lark --lark-config lark-config.json
 ~~~
 
-EC2 IAM Role 省略 --profile audit。只生成报告时省略 --send-lark。Windows 将 Python 路径替换为 .\.venv\Scripts\python.exe。
+缓存日报不连接 AWS；profile、regions、interval 必须与采集范围一致。匹配到多个账号时加 `--cache-account-id <账号ID>`。CLI 默认 cache-dir 是 reports/cache，安装器默认项目下 cache，与服务配合请显式指定。显式补报带 --send-lark 会再次发送。
 
---date 是窗口结束日期。例如下面采集北京时间 2026-10-28 07:00 至 2026-10-29 08:00：
+一次性直接查询 AWS 仍可使用，采集后自动生成 HTML：
 
 ~~~bash
-.venv/bin/python rds_audit.py --daily --date 2026-10-29 --profile audit --regions ap-southeast-1
+.venv/bin/python rds_audit.py --profile audit --regions ap-east-1 --days 1 \
+  --download-sql-logs --output-dir reports/ap-east-1-check
 ~~~
 
-手动指定的窗口尚未结束时会拒绝，不会缩短窗口冒充完整日报。--daily 不能和原始采集模式的 --days、--start、--end 混用。日报会下载当前可见的标准 CloudWatch audit / general 日志；不会自动改变数据库的审计配置。
+`--daily` 不加 `--from-cache` 仍直接采集固定日报窗口，适合有意补采，不作为定时默认方式。`--days`、`--start` / `--end` 是自定义窗口；未下载 audit 正文时无法生成 SQL 明细。`--download-instance-logs` 是显式原始取证选项，会下载整文件，可能含 SELECT 等查询，不用于定时增量采集。
 
-自定义窗口使用 `--days` 或 `--start` / `--end`，自动输出 HTML、`daily-report.json` 和 CSS。需要 SQL 明细时保留 `--download-sql-logs`；只列日志目录的采集不会凭空生成 SQL 明细。显式自定义窗口也可搭配 `--send-lark` 或 `--publish-dir`，仅在明确提供这些开关时执行推送或发布。
+EC2 IAM Role 省略 --profile audit；只生成不推送则省略 --send-lark。Windows Python 路径改为 `.\.venv\Scripts\python.exe`。
 
-## HTML、归档与 Lark
+## 轻量 HTML 与已有数据
 
-每次采集使用独立运行目录，保留原始证据和日报。下面对应显式设置 --output-dir reports；未指定时父目录默认为 reports/rds：
+首页最多预览 20 条记录、100 位操作者；全部增删改、操作者、失败请求和质量问题分别分页，每页最多 100 条。长 SQL、大字段有展示上限，完整规范化字段保存在服务器 `daily-report.json`；浏览器不会自动读取整个 JSON 或原始日志。
+
+日报目录示意：
 
 ~~~text
-reports/<AWS账号ID>/<日报日期>/<运行目录>/
-  report.json                         原始采集状态、范围、配置与错误
-  management-events.jsonl              RDS 管理 API 原文
-  rds-events.jsonl                     RDS 服务通知
-  cloudwatch/*.jsonl                   已下载的 SQL 原始日志
-  daily-report.json                   规范化日报、分来源计数和明细
-  YYYY-MM-DD-rds操作审计.html          中文 HTML 日报
-  rds-report.css                      报告样式
+reports/<账号>/<日报日期>/<运行目录>/
+  report.json                         采集范围、分段覆盖、状态和错误
+  management-events.jsonl              保留的管理变更记录
+  cloudwatch/*.jsonl                   audit 变更原文片段与源位置
+  quarantine/sql-unclassified.jsonl    可选，无法分类的证据
+  daily-report.json                    完整规范化服务器归档
+  YYYY-MM-DD-rds操作审计.html          轻量总览
+  YYYY-MM-DD-rds操作审计-pages-<hash>/  按需打开的明细页
+  YYYY-MM-DD-rds操作审计-完整报告.zip   总览、CSS 与明细页
+  rds-report.css                       配套样式
 ~~~
 
-自定义窗口的运行目录不增加日报日期层，HTML 文件名为 `YYYY-MM-DD-rds操作审计-自定义窗口.html`。标题和页面显示真实起止时间，不套用固定日报的 25 小时窗口或跨日报重叠说明；原始 JSONL 仍然保留。
+自定义窗口目录没有日报日期层，HTML 文件名多 `-自定义窗口`。页面内置样式并保留外部 CSS 回退，单独复制首页也有样式；**查看明细必须保留分页文件夹，或下载并解压完整报告 ZIP**。ZIP 不包含完整 JSON 和原始日志，原始证据仍保存在服务器。不要直接公开归档目录。
 
-报告按“总览 → 操作者 → 具体操作”排列，包含北京时间、身份或数据库账号、增删改分类、操作内容、资源、区域、来源 IP 和结果。SQL 可能含业务值，报告应保存在受控位置。查看日期 HTML 时保留同目录的 rds-report.css。
+`--publish-dir /var/www/rds-audit` 复制总览、CSS、明细页、ZIP 并更新 index.html，不发布原始 JSON/JSONL。项目不安装网站或修改反向代理。Lark 只发数量、状态、范围与已配置链接，不发送 SQL 正文。
 
-已有 Web 服务时，可将最新报告副本写入它的文档目录：
+已有 40,510 条 CloudWatch 事件的香港目录可离线重建为排除查询的分页报告：
 
 ~~~bash
-.venv/bin/python rds_audit.py --daily --profile audit --regions all \
-  --publish-dir /var/www/rds-audit --send-lark --lark-config lark-config.json
-~~~
-
-发布仅复制 HTML 和样式，并更新 index.html；原始 JSON 不复制到该目录。项目不会自动安装网站、开放端口或修改反向代理。需自行将 Web 服务映射到发布目录，并将真实地址填进 Lark 配置。报告使用独立 CSS，无内联脚本，适合现有同源资源策略。
-
-Lark 复用项目的机器人通知模块，只发送日期、账号、北京时间范围、增删改数量、采集状态和已配置的详情链接，不发送 SQL 正文。未配置报告地址时应从服务器查看归档，不应把占位地址作为可用链接。预检只验证本地格式及 AWS 读取权限，不能证明远端机器人 token 有效；只有真实发送才能验证。
-
-## 已发现日志组但尚未下载日志
-
-安装器执行的是 `--check-config` 预检：它会打印匹配的 audit/general 日志组名称并验证读取接口，但不会下载或保存日志，也不能根据权限探针判断历史日志是否有内容。正式采集时才会输出窗口、每个日志组下载的 CloudWatch 事件数与文件位置；事件条数不等于 SQL 语句或受影响行数。
-
-首次启用定时器后，如果 `systemctl list-timers` 显示 `LAST -`，且服务日志为 `No entries`，请先确认尚未执行正式采集。要立即生成日报并发送汇总，可执行 `systemctl start aws-rds-audit.service`。
-
-例如香港区域的日志组 `/aws/rds/cluster/shenji/audit` 符合匹配规则；`error` 和 `RDSOSMetrics` 不属于 SQL audit/general，不纳入数据库增删改统计。单独检查香港近 24 小时的原始日志、且不发送 Lark：
-
-```bash
-cd /usr/local/aws-rds-shenji
-.venv/bin/python rds_audit.py --profile audit --regions ap-east-1 --days 1 --download-sql-logs --output-dir reports/ap-east-1-check
-```
-
-这条命令会自动生成最近 24 小时的 HTML 汇总。也可检查输出目录中的 `report.json`（`sql_log_groups` 下的 `download.status`、`event_count`）以及 `cloudwatch/*.jsonl`。当天日报截至北京时间 08:00；当天 08:00 后才产生的日志不属于该份日报，应检查上述最近 24 小时窗口或后续日报。日志组存在不代表其中一定已有 SQL 事件。下载的 CloudWatch 事件数量不等于最终增删改条数，解析失败的记录会保留证据并将报告标记为不完整。
-
-## 已有采集结果与演示
-
-已有运行目录可离线生成 HTML。未指定 `--daily` 或 `--date` 时，按 `report.json` 中存储的完整原始时间窗口汇总；新的采集元数据若含 `period_kind`，保留其 daily/custom 类型，旧目录没有该字段时按自定义窗口处理。此过程不连接 AWS，不重新下载日志，也不修改已有原始 JSONL。
-
-例如已经下载了 40,510 条 CloudWatch 事件的香港目录，可以直接执行：
-
-```bash
 cd /usr/local/aws-rds-shenji
 .venv/bin/python rds_audit.py --input-dir reports/ap-east-1-check/796973492024/20261029T093255Z-20ece9a5
-```
-
-该目录的实际窗口为北京时间 2026-10-28 17:32:55 至 2026-10-29 17:32:55。这里不要加 `--date` 或 `--daily`，否则会改为要求原始数据覆盖指定的固定日报窗口。40,510 是下载事件数，增删改计数仍以可解析、未报错的 API/SQL 记录为准，不能直接用下载事件数代替。
-
-确实需要从已有数据生成某天的固定日报时，显式指定日期；原目录必须完整覆盖该 25 小时窗口：
-
-~~~bash
-.venv/bin/python rds_audit.py --input-dir reports/<账号>/<日报日期>/<运行目录> --date 2026-10-29
 ~~~
 
-仓库演示数据不代表真实 AWS 活动：
+不连接 AWS、不重新下载、不修改原始 JSONL。该目录实际窗口为北京时间 2026-10-28 17:32:55 至 2026-10-29 17:32:55，请不要加 --daily 或 --date，否则会要求覆盖另一个完整 25 小时窗口。40,510 是候选事件量，不能代替增删改数量。离线输入表示本次未连接 AWS；只有元数据明确 example_data=true 才视为演示数据。
 
-~~~bash
-.venv/bin/python rds_audit.py --input-dir examples/daily-sample --date 2026-10-29
-~~~
+## 结果验证
 
-从已有目录生成的报告标记为离线输入，表示本次未连接 AWS，不意味着归档数据是虚构样例。只有采集元数据明确设置 example_data=true 时才标记为演示数据；仓库自带样例属于这种情况，不能用样例中的数量或身份判断真实账号活动。
+没有日志、没有实例、权限不足、采集或解析失败，均不能证明没有数据库操作。请结合 report.json、分段覆盖、质量问题页和告警判断。
 
-## 结果校验
-
-采集或解析失败会在 JSON 与报告中标记不完整，已取得的数据仍保留。权限不足、某区域访问失败、空日志、日志轮转或尚未发布，都不能解释为“没有操作”。没有数据库 audit 日志时，API 部分仍可出报告，但不能据此断言内部没有 SQL 增删改。
-
-主程序退出码：0 表示所请求步骤完成；1 表示参数、凭据或启动前提失败；2 表示采集或解析不完整；3 表示报告已保留但 Lark 发送失败；4 表示报告已保留但网页发布失败。采集不完整的退出码 2 优先于之后的发布或通知错误。
-
-运行离线测试：
+退出码：0 为请求步骤完成；1 为参数或启动前提失败；2 为采集、覆盖、解析不完整，或增量任务有失败/待投递告警；3 为报告保留但 Lark 失败；4 为报告保留但发布失败。不完整状态优先于后续投递错误。
 
 ~~~bash
 .venv/bin/python -m unittest -v
 ~~~
 
-测试使用模拟 AWS 响应，不需要真实凭据，也不会发送 Lark。安装脚本的语法和模拟环境检查不能替代目标服务器上的软件源、身份权限和定时器验证。
+测试使用模拟 AWS 响应，不需要真实凭据，不发送 Lark。仓库测试不能替代目标服务器权限、软件源、真实 Webhook 与定时服务验证。

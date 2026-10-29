@@ -64,11 +64,13 @@ def build_command(environment: dict[str, str], *, check=False, now=None) -> list
     if check:
         command.append("--check-config")
     else:
-        command.extend(["--daily", "--date", latest_completed_date(now)])
+        command.extend(["--daily", "--from-cache", "--date", latest_completed_date(now)])
     command.extend([
         "--regions", environment.get("AWS_RDS_REGIONS") or "all",
         "--output-dir", environment.get("AWS_RDS_REPORT_ROOT") or str(PROJECT / "reports"),
         "--send-lark", "--lark-config", environment.get("AWS_RDS_LARK_CONFIG") or str(PROJECT / "lark-config.json"),
+        "--cache-dir", environment.get("AWS_RDS_CACHE_DIR") or str(PROJECT / "cache"),
+        "--interval-minutes", environment.get("AWS_RDS_INTERVAL_MINUTES") or "30",
     ])
     if environment.get("AWS_PROFILE"):
         command.extend(["--profile", environment["AWS_PROFILE"]])

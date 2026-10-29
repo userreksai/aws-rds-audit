@@ -1,0 +1,22 @@
+[Unit]
+Description=AWS RDS incremental change-only collection, retry and Lark alerts
+Wants=network-online.target
+After=network-online.target time-sync.target
+OnFailure=aws-rds-audit-failure@%n.service
+
+[Service]
+Type=oneshot
+SuccessExitStatus=2
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=@PROJECT_ROOT@
+Environment=@HOME_ENV@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/aws-rds-audit.env
+ExecStart=@PYTHON@ @RUNNER@
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=45min

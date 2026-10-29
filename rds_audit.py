@@ -26,7 +26,7 @@ PARAMETERS = {
     "binlog_expire_logs_seconds", "expire_logs_days", "log_bin", "aws_default_logs_role",
 }
 LIMITATIONS = [
-    "CloudTrail is RDS management API history, not ordinary database SQL history; both read and write API calls are retained.",
+    "CloudTrail is RDS management API history, not ordinary database SQL history; only recognized create/delete/modify requests are retained, including failed requests.",
     "Only the current account and selected Regions are queried. CloudTrail history is limited to 90 days; S3/Lake archives and Data API data events are not queried.",
     "RDS service notifications cover at most the last 14 days; they are not a record of all user actions.",
     "MySQL audit settings are current AWS control-plane configuration, not proof of effective runtime values or past audit coverage.",
@@ -167,6 +167,7 @@ class Collector:
             "started_at": iso(datetime.now(UTC)),
             "window": {"start_inclusive": iso(start), "end_exclusive": iso(end)},
             "scope": "Current account; RDS management history; MySQL/Aurora MySQL SQL audit inspection",
+            "operation_scope": "changes_only",
             "sql_log_download_requested": args.download_sql_logs,
             "instance_log_download_requested": args.download_instance_logs,
             "limitations": LIMITATIONS, "checks": [], "regions": {},
@@ -203,6 +204,8 @@ class Collector:
         return result
 
     def management_events(self, region, handle, summary):
+        from rds_change_filter import keep_management_event
+
         ct = self.client("cloudtrail", region)
         seen = set()
         for event in iter_items(
@@ -217,6 +220,9 @@ class Collector:
                 continue
             seen.add(event_id)
             raw = json.loads(event["CloudTrailEvent"])
+            if not keep_management_event({**raw, "readOnly": raw.get("readOnly", event.get("ReadOnly", False))}):
+                summary["filtered_management_event_count"] = summary.get("filtered_management_event_count", 0) + 1
+                continue
             write_json_line(handle, {"region": region, "event": raw, "lookup": {k: v for k, v in event.items() if k != "CloudTrailEvent"}})
             summary["management_event_count"] += 1
 
@@ -315,6 +321,8 @@ class Collector:
                 row["download"].update(status="ok", **result)
 
     def cloudwatch(self, region, summary):
+        from rds_change_filter import audit_event_decision
+
         logs = self.client("logs", region)
         for group in iter_items(
             logs, "describe_log_groups", "logGroups", request_token="nextToken", response_token="nextToken",
@@ -330,29 +338,66 @@ class Collector:
                 item["download"] = {"status": "not_requested"}
                 print(f"{region}: {name} 仅列目录，未请求下载日志。", flush=True)
                 continue
+            if name.endswith("/general"):
+                item["download"] = {"status": "skipped_read_logs", "reason": "仅增删改模式使用 audit 审计记录，general 正文不采集，避免保留大量查询或重复计数。"}
+                print(f"{region}: {name} 跳过 general 正文（仅采集 audit 增删改）。", flush=True)
+                continue
             directory = self.directory / "cloudwatch"
             directory.mkdir(exist_ok=True)
             path = directory / (safe_name(f"{region}/{name}") + ".jsonl")
-            item["download"] = {"path": str(path.relative_to(self.directory)), "status": "error", "event_count": 0}
+            item["download"] = {"path": str(path.relative_to(self.directory)), "status": "error", "event_count": 0,
+                                "received_event_count": 0, "change_record_count": 0, "filtered_read_record_count": 0,
+                                "filtered_auxiliary_record_count": 0, "quarantined_record_count": 0}
 
             def download():
-                with path.open("x", encoding="utf-8", newline="\n") as handle:
-                    for event in iter_items(
-                        logs, "filter_log_events", "events", request_token="nextToken", response_token="nextToken",
-                        logGroupName=name, startTime=int(self.start.timestamp() * 1000), endTime=int(self.end.timestamp() * 1000),
-                    ):
-                        timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, UTC)
-                        if in_window(timestamp, self.start, self.end):
-                            write_json_line(handle, {"region": region, "logGroupName": name, **event})
-                            item["download"]["event_count"] += 1
+                quarantine = None
+                try:
+                    with path.open("x", encoding="utf-8", newline="\n") as handle:
+                        for event in iter_items(
+                            logs, "filter_log_events", "events", request_token="nextToken", response_token="nextToken",
+                            logGroupName=name, startTime=int(self.start.timestamp() * 1000), endTime=int(self.end.timestamp() * 1000),
+                        ):
+                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, UTC)
+                            if not in_window(timestamp, self.start, self.end):
+                                continue
+                            counts = item["download"]
+                            counts["received_event_count"] += 1
+                            envelope = {"region": region, "logGroupName": name, **event}
+                            decision = audit_event_decision(envelope)
+                            counts["change_record_count"] += decision["change_records"]
+                            counts["filtered_read_record_count"] += decision["read_records"]
+                            counts["filtered_auxiliary_record_count"] += decision["auxiliary_records"]
+                            if decision["unknown_records"]:
+                                if quarantine is None:
+                                    quarantine_path = self.directory / "quarantine" / "sql-unclassified.jsonl"
+                                    quarantine_path.parent.mkdir(exist_ok=True)
+                                    quarantine = quarantine_path.open("a", encoding="utf-8", newline="\n")
+                                    counts["quarantine_path"] = str(quarantine_path.relative_to(self.directory))
+                                for evidence in decision["unknown_records"]:
+                                    write_json_line(quarantine, evidence)
+                                    counts["quarantined_record_count"] += 1
+                            if not decision["keep"]:
+                                continue
+                            envelope["message"] = "\n".join(segment["raw"] for segment in decision["retained_segments"])
+                            envelope["original_record_indexes"] = [segment["record_index"] for segment in decision["retained_segments"]]
+                            write_json_line(handle, envelope)
+                            counts["event_count"] += 1
+                finally:
+                    if quarantine is not None:
+                        quarantine.close()
                 item["download"]["status"] = "ok"
 
             self.check(f"{region}:download_cloudwatch:{name}", download)
             if item["download"]["status"] == "ok":
-                count = item["download"]["event_count"]
-                print(f"{region}: {name} 已下载 {count} 条 CloudWatch 日志事件；文件 {path.resolve()}", flush=True)
-                if not count:
+                counts = item["download"]
+                print(f"{region}: {name} 接收候选事件 {counts['received_event_count']} 条，保留含增删改事件 {counts['event_count']} 条（增删改记录 {counts['change_record_count']} 条），排除查询 {counts['filtered_read_record_count']} 条、辅助记录 {counts['filtered_auxiliary_record_count']} 条；文件 {path.resolve()}", flush=True)
+                if counts["quarantined_record_count"]:
+                    self.report["checks"].append({"scope": f"{region}:classify_sql:{name}", "status": "error", "error_type": "UnclassifiedSqlRecords", "message": f"{counts['quarantined_record_count']} 条无法确定为增删改的记录已独立留档；请检查 {counts['quarantine_path']}"})
+                    print(f"{region}: 隔离未识别审计记录 {counts['quarantined_record_count']} 条；未混入增删改汇总。", flush=True)
+                if not counts["received_event_count"]:
                     print(f"{region}: 当前查询窗口未取得已保留的日志事件，不能据此判断没有 SQL 操作；请核对产生日志的时间与保留范围。", flush=True)
+                elif not counts["change_record_count"]:
+                    print(f"{region}: 查询窗口内没有取得可可靠识别的增删改记录；已知查询/辅助记录已排除，未知记录单独留档。", flush=True)
 
     def run(self):
         try:
@@ -365,7 +410,7 @@ class Collector:
                     self.report["regions"][region] = summary
                     self.check(f"{region}:cloudtrail", lambda: self.management_events(region, management, summary))
                     rds = self.check(f"{region}:initialize_rds_client", lambda: self.client("rds", region))
-                    if rds is not None:
+                    if rds is not None and not getattr(self.args, "metadata_light", False):
                         self.check(f"{region}:service_events", lambda: self.service_events(region, rds, events, summary))
                         self.check(f"{region}:inventory", lambda: self.inventory(region, rds, summary))
                     self.check(f"{region}:cloudwatch_discovery", lambda: self.cloudwatch(region, summary))
@@ -402,6 +447,15 @@ def build_parser():
     parser.add_argument("--send-lark", action="store_true", help="生成HTML后向配置的Lark群发送汇总")
     parser.add_argument("--lark-config", type=Path, default=Path("lark-config.json"), help="Lark私有配置路径")
     parser.add_argument("--check-config", action="store_true", help="只检查AWS身份/可见资源读取权限及可选Lark配置，不生成报告、不发消息")
+    parser.add_argument("--collect-incremental", action="store_true", help="按半小时/小时分段采集增删改到本地缓存，失败重试并可发Lark告警")
+    parser.add_argument("--from-cache", action="store_true", help="--daily仅汇总本地成功分段，不发起25小时AWS查询")
+    parser.add_argument("--cache-dir", type=Path, default=Path("reports/cache"), help="增量缓存及检查点目录")
+    parser.add_argument("--cache-account-id", help="本地缓存有多个账号时指定账号ID")
+    parser.add_argument("--interval-minutes", type=int, choices=(30, 60), default=30, help="采集分段分钟数，默认30")
+    parser.add_argument("--cache-lookback-hours", type=int, default=26, help="自动补齐最近小时数，默认26")
+    parser.add_argument("--max-buckets-per-run", type=int, default=6, help="单次最多处理分段数，默认6，分摊首次回补压力")
+    parser.add_argument("--notify-service-failure", action="store_true", help="systemd异常退出告警入口，不连接AWS")
+    parser.add_argument("--source-service", help="异常退出的本项目服务名称")
     return parser
 
 
@@ -436,7 +490,7 @@ def check_configuration(args):
     lark_configuration(args)
     session, config, identity = aws_session(args)
     # Check as the same OS user that systemd will use, without creating probe files.
-    for path in (args.output_dir / identity["Account"], args.publish_dir):
+    for path in (args.output_dir / identity["Account"], args.publish_dir, args.cache_dir):
         if path is None:
             continue
         existing = path.resolve()
@@ -479,6 +533,9 @@ def check_configuration(args):
             if groups:
                 print(f"{region}: 已发现 /aws/rds/ 日志组 {len(groups)} 个，其中 audit/general {len(sql_groups)} 个。", flush=True)
             for name in sql_groups:
+                if name.endswith("/general"):
+                    print(f"{region}: {name} 仅列目录；增删改采集不下载 general 正文。", flush=True)
+                    continue
                 print(f"{region}: 已发现 SQL 日志组 {name}，正在验证读取接口权限…", flush=True)
                 stamp = int(datetime.now(UTC).timestamp() * 1000)
                 logs.filter_log_events(logGroupName=name, startTime=stamp - 1, endTime=stamp, limit=1)
@@ -519,17 +576,37 @@ def finish_daily(directory, audit_date, start, end, args, status, lark_config=No
 
     report = build_daily_report(directory, audit_date=audit_date, start=start, end=end, offline=bool(args.input_dir), period_kind=period_kind)
     html_path = write_report(report, directory)
+    args._delivery_failed = False
     status = 2 if status == 2 or not report["metadata"]["complete"] else status
     print(f"{'HTML日报' if period_kind == 'daily' else 'HTML报告'}: {html_path.resolve()}")
     if args.publish_dir:
         try:
             publish = args.publish_dir.resolve()
-            # Raw JSON/SQL stays outside the web publication directory.
-            atomic_copy(directory / "rds-report.css", publish / "rds-report.css")
+            # Publish the complete paginated snapshot before replacing the entry point.
+            artifacts = report.get("artifacts") or {}
+            manifest = artifacts.get("manifest") or ["rds-report.css", html_path.name]
+            prepared = []
+            root = directory.resolve()
+            for name in manifest:
+                relative = Path(name)
+                source = (directory / relative).resolve()
+                if relative.is_absolute() or ".." in relative.parts or not source.is_relative_to(root):
+                    raise OSError("报告附件路径越出归档目录")
+                allowed = name in {"rds-report.css", html_path.name, artifacts.get("bundle_filename")}
+                allowed = allowed or (relative.parts and relative.parts[0] == artifacts.get("detail_directory") and relative.suffix == ".html")
+                if not allowed or not source.is_file():
+                    raise OSError(f"报告附件缺失或不允许发布: {name}")
+                prepared.append((source, publish / relative))
+            for source, target in prepared:
+                if target.name != html_path.name:
+                    atomic_copy(source, target)
+                    if target.parent != publish:
+                        target.parent.chmod(0o755)
             atomic_copy(html_path, publish / html_path.name)
             atomic_copy(html_path, publish / "index.html")
             print(f"最新网页: {publish / 'index.html'}")
         except OSError as exc:
+            args._delivery_failed = True
             print(f"网页发布失败，未发送Lark，归档已保留: {exc}", file=sys.stderr)
             return 2 if status == 2 else 4
     if args.send_lark:
@@ -538,6 +615,7 @@ def finish_daily(directory, audit_date, start, end, args, status, lark_config=No
             send_lark_notification(report, lark_config or lark_configuration(args, audit_date))
             print("Lark汇总已发送。")
         except (ValueError, RuntimeError, OSError) as exc:
+            args._delivery_failed = True
             print(f"Lark汇总发送失败，报告已保留: {exc}", file=sys.stderr)
             return 2 if status == 2 else 3
     return status
@@ -585,10 +663,25 @@ def main(argv=None):
     except SystemExit as exc:
         return 0 if exc.code == 0 else 1
     try:
+        if sum(bool(flag) for flag in (args.collect_incremental, args.from_cache, args.notify_service_failure)) > 1:
+            raise ValueError("增量采集、缓存汇总和服务失败告警模式不能同时使用")
         if args.check_config:
             if args.input_dir:
                 raise ValueError("--check-config 不支持 --input-dir")
             return check_configuration(args)
+        if args.notify_service_failure:
+            from rds_jobs import notify_service_failure
+            return notify_service_failure(args, api=sys.modules[__name__])
+        if args.collect_incremental:
+            if args.daily or args.from_cache or args.input_dir or args.date or args.days is not None or args.start or args.end:
+                raise ValueError("增量采集模式不能与日报/离线输入/自定义窗口混用")
+            from rds_jobs import run_incremental
+            return run_incremental(args, api=sys.modules[__name__])
+        if args.from_cache:
+            if not args.daily or args.input_dir or args.days is not None or args.start or args.end:
+                raise ValueError("--from-cache 必须配合 --daily，不能与其他输入窗口混用")
+            from rds_jobs import run_cached_daily
+            return run_cached_daily(args, api=sys.modules[__name__])
         now = datetime.now(UTC)
         period_kind, audit_date, start, end = resolve_report_window(args, now)
         config_lark = lark_configuration(args, audit_date)

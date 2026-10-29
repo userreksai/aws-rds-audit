@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 UTC = timezone.utc
 BEIJING = ZoneInfo("Asia/Shanghai")
 CATEGORIES = ("新增", "删除", "修改", "其他操作")
+CHANGE_CATEGORIES = frozenset(CATEGORIES[:3])
 SOURCE_LABELS = {"management": "RDS 管理 API", "sql": "数据库 SQL 审计"}
 SENSITIVE_PARTS = ("password", "secret", "token", "credential", "privatekey", "accesskey")
 AUDIT_START = re.compile(r"(?m)^(?:\d{8}\s\d{2}:\d{2}:\d{2}|\d{10,16}(?:\.\d+)?),")
@@ -78,13 +79,13 @@ def classify_api(name: str, read_only=False) -> str:
     return "其他操作"
 
 
-def classify_sql(sql: str) -> str:
+def sql_body(sql: str) -> str:
     remaining = sql.lstrip()
     while remaining:
         if remaining.startswith("/*") and not remaining.startswith(("/*!", "/*+")):
             end = remaining.find("*/")
             if end < 0:
-                return "其他操作"
+                return remaining
             remaining = remaining[end + 2:].lstrip()
             continue
         comment = re.match(r"(?:--(?=\s)|#)[^\r\n]*(?:\r?\n|$)", remaining)
@@ -92,6 +93,11 @@ def classify_sql(sql: str) -> str:
             remaining = remaining[comment.end():].lstrip()
             continue
         break
+    return remaining
+
+
+def classify_sql(sql: str) -> str:
+    remaining = sql_body(sql)
     word = re.match(r"[A-Za-z]+", remaining)
     command = word.group().upper() if word else ""
     # This parser deliberately does not implement MySQL's complete lexical rules.
@@ -102,11 +108,56 @@ def classify_sql(sql: str) -> str:
         return "其他操作"
     if command in {"INSERT", "CREATE"}:
         return "新增"
+    if command == "LOAD" and re.match(r"LOAD\s+(?:DATA|XML)\b", remaining, re.I):
+        return "新增"
     if command in {"DELETE", "DROP", "TRUNCATE"}:
         return "删除"
-    if command in {"UPDATE", "ALTER", "RENAME", "GRANT", "REVOKE"}:
+    if command in {"UPDATE", "ALTER", "RENAME", "GRANT", "REVOKE", "REPLACE", "MERGE"}:
+        return "修改"
+    if command == "SET" and re.match(r"SET\s+(?:GLOBAL\b|PERSIST(?:_ONLY)?\b|PASSWORD\b|@@GLOBAL\.)", remaining, re.I):
         return "修改"
     return "其他操作"
+
+
+def row_disposition(row: dict) -> str:
+    """Only classified mutations enter the primary report; unknown isn't read-only."""
+    if row.get("category") in CHANGE_CATEGORIES:
+        return "change"
+    operation = str(row.get("event_name") or "").upper()
+    if operation != "QUERY" and not operation.startswith("QUERY_"):
+        return "auxiliary"
+    remaining = sql_body(str(row.get("sql") or ""))
+    if ";" in remaining.rstrip().removesuffix(";"):
+        return "unknown"
+    word = re.match(r"[A-Za-z]+", remaining)
+    command = word.group().upper() if word else ""
+    if command in {"SELECT", "SHOW", "DESCRIBE", "DESC"}:
+        return "read"
+    if command == "EXPLAIN":
+        return "unknown" if re.match(r"EXPLAIN\s+ANALYZE\b", remaining, re.I) else "read"
+    if command in {"BEGIN", "START", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "USE"}:
+        return "auxiliary"
+    if command == "SET" and re.match(r"SET\s+(?:SESSION\b|NAMES\b|CHARACTER\s+SET\b|AUTOCOMMIT\b|TRANSACTION\b)", remaining, re.I):
+        return "auxiliary"
+    return "unknown"
+
+
+def split_audit_message(message: str) -> list[str]:
+    starts = [match.start() for match in AUDIT_START.finditer(message)]
+    if not starts or message[:starts[0]].strip():
+        return [message]
+    return [message[position:(starts[index + 1] if index + 1 < len(starts) else len(message))] for index, position in enumerate(starts)]
+
+
+def audit_record_indexes(envelope: dict, count: int) -> list[int]:
+    indexes = envelope.get("original_record_indexes")
+    if indexes is None:
+        return list(range(count))
+    if (not isinstance(indexes, list) or len(indexes) != count or
+            any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in indexes) or
+            len(set(indexes)) != count):
+        raise ValueError("original_record_indexes must contain one unique nonnegative integer per audit record")
+    return indexes
 
 
 def _actor(identity, fallback=""):
@@ -292,12 +343,30 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
     collection = json.loads((directory / "report.json").read_text(encoding="utf-8-sig"))
     errors = [redact(check) for check in collection.get("checks", []) if check.get("status") == "error"]
     events, unparsed, seen_management, seen_sql = [], [], set(), set()
+    seen_unknown = set()
+    filtered_management = filtered_queries = filtered_auxiliary = unclassified = 0
+
+    def preserve_unknown(evidence, envelope, index):
+        event_id = str(envelope.get("eventId") or "")
+        reason = evidence.get("reason", "parse_error")
+        if event_id:
+            key = (str(envelope.get("region") or ""), str(envelope.get("logGroupName") or ""), str(envelope.get("logStreamName") or ""), event_id, index, reason)
+            if key in seen_unknown:
+                return False
+            seen_unknown.add(key)
+        evidence.update(event_id=event_id, record_index=index, reason=reason)
+        unparsed.append(evidence)
+        errors.append({key: value for key, value in evidence.items() if key != "raw"})
+        return True
     for line_number, envelope in _json_lines(directory / "management-events.jsonl", errors):
         try:
             row = normalize_management(envelope)
             if not start <= timestamp(row["time_utc"]) < end or row["event_id"] in seen_management:
                 continue
             seen_management.add(row["event_id"])
+            if row["category"] not in CHANGE_CATEGORIES:
+                filtered_management += 1
+                continue
             events.append(row)
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             errors.append({"scope": "parse_management", "line": line_number, "message": str(exc)})
@@ -322,19 +391,54 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
                 seen_sql.add(dedup)
             audit_envelopes += 1
             message = str(envelope.get("message") or "")
-            starts = [match.start() for match in AUDIT_START.finditer(message)]
-            if not starts or message[:starts[0]].strip():
-                starts = []
-            segments = [message[position:(starts[index + 1] if index + 1 < len(starts) else len(message))] for index, position in enumerate(starts)] or [message]
-            for index, segment in enumerate(segments):
+            segments = split_audit_message(message)
+            try:
+                indexes = audit_record_indexes(envelope, len(segments))
+            except ValueError as exc:
+                preserve_unknown({"scope": "parse_sql", "file": path.name, "line": line_number, "message": str(exc), "log_group": group, "log_stream": str(envelope.get("logStreamName") or ""), "raw": redact_text(message)}, envelope, None)
+                continue
+            for index, segment in zip(indexes, segments):
                 try:
                     row = parse_audit_record(segment, envelope, index)
-                    if start <= timestamp(row["time_utc"]) < end:
+                    if not start <= timestamp(row["time_utc"]) < end:
+                        continue
+                    disposition = row_disposition(row)
+                    if disposition == "change":
                         events.append(row)
+                    elif disposition == "read":
+                        filtered_queries += 1
+                    elif disposition == "auxiliary":
+                        filtered_auxiliary += 1
+                    else:
+                        evidence = {"scope": "classify_sql", "reason": "unclassified_sql", "file": path.name, "line": line_number, "record_index": index, "message": "SQL cannot be reliably classified as create/delete/modify; preserved separately", "log_group": group, "log_stream": str(envelope.get("logStreamName") or ""), "raw": redact_text(segment)}
+                        unclassified += preserve_unknown(evidence, envelope, index)
                 except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation) as exc:
                     evidence = {"scope": "parse_sql", "file": path.name, "line": line_number, "record_index": index, "message": str(exc), "log_group": group, "log_stream": str(envelope.get("logStreamName") or ""), "raw": redact_text(segment)}
-                    unparsed.append(evidence)
-                    errors.append({key: value for key, value in evidence.items() if key != "raw"})
+                    preserve_unknown(evidence, envelope, index)
+    quarantine_path = directory / "quarantine" / "sql-unclassified.jsonl"
+    if quarantine_path.is_file():
+        for line_number, envelope in _json_lines(quarantine_path, errors):
+            try:
+                occurred = datetime.fromtimestamp(int(envelope["timestamp"]) / 1000, UTC)
+                if not start <= occurred < end:
+                    continue
+            except (ValueError, TypeError, KeyError, OverflowError):
+                pass  # Preserve malformed evidence rather than guessing it is outside the window.
+            evidence = {
+                "scope": "quarantine_sql", "reason": envelope.get("reason", "parse_error"),
+                "file": str(quarantine_path.relative_to(directory)), "line": line_number,
+                "message": str(envelope.get("message") or "Uncertain SQL preserved during collection"),
+                "log_group": str(envelope.get("logGroupName") or ""), "log_stream": str(envelope.get("logStreamName") or ""),
+                "raw": redact_text(str(envelope.get("raw") or "")),
+            }
+            if preserve_unknown(evidence, envelope, envelope.get("record_index")) and evidence["reason"] == "unclassified_sql":
+                unclassified += 1
+    for region in collection.get("regions", {}).values():
+        filtered_management += int(region.get("filtered_management_event_count") or 0)
+        for group in region.get("sql_log_groups", []):
+            download = group.get("download") or {}
+            filtered_queries += int(download.get("filtered_read_record_count") or 0)
+            filtered_auxiliary += int(download.get("filtered_auxiliary_record_count") or 0)
     events.sort(key=lambda row: (row["time_utc"], row["source_kind"], row["event_id"]))
     counts = dict.fromkeys(CATEGORIES, 0)
     attempted = dict.fromkeys(CATEGORIES, 0)
@@ -358,7 +462,8 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
     notes = [
         "新增、删除、修改统计的是日志中未报错的 API 请求或 SQL 语句条数，不是受影响行数。失败请求保留在明细和失败数量中，不计入成功返回的增删改。",
         "API 未报错不保证异步变更最终完成；SQL 返回码 0 不证明事务最终 COMMIT。两种来源分别汇总，共用数据库账号不能推定真实人员。",
-        "只对可见的 audit 日志进行 SQL 分类；general 日志保留原文而不重复计数，TABLE/连接等辅助审计事件只列明细，不计入语句数量。复杂 WITH、CALL、PREPARE、EXECUTE、包含内部分号的语句等无法可靠识别时保留其他操作。",
+        "主报告仅保留可识别的新增、删除、修改；只读管理 API、SELECT 等查询、连接及 TABLE 辅助记录不进入明细。general 日志不参与增删改统计，避免与 audit 重复计数。",
+        "复杂 WITH、CALL、PREPARE、EXECUTE、包含内部分号的语句及无法解析的记录独立保留为待核查证据，不冒充只读，也不计入增删改数量。",
         "无日志不等于无 SQL 操作：审计可能未启用、被用户/事件过滤、延迟、截断或超过保留期。当前配置不能证明历史覆盖完整。",
         "MySQL 无时区的日志原时间不用于猜测时区，报告使用 CloudWatch 事件时间；原时间保留。Aurora Unix 时间戳按 UTC 转换。",
         "SQL 正文可能包含业务数据。已对常见凭据字段和口令语句脱敏，无法保证识别全部业务敏感值；请限制报告访问。",
@@ -381,11 +486,13 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
             "errors": errors, "offline": bool(offline), "example_data": bool(collection.get("example_data", False)), "counts": counts, "attempted_counts": attempted,
             "total": len(events), "counted_total": sum(counts.values()), "failed_or_partial": sum(row["status"] == "failed" for row in events),
             "historical_sql_completeness": "not_established",
+            "source_cache": collection.get("source_cache"),
+            "change_only": True,
             "report_filename": f"{audit_date}-rds操作审计{'-自定义窗口' if period_kind == 'custom' else ''}.html",
         },
         "events": events, "by_source": by_source,
         "actors": sorted(actor_rows.values(), key=lambda item: (-item["total"], item["actor_key"])),
-        "coverage": {"notes": notes, "audit_cloudwatch_events": audit_envelopes, "general_log_events_not_counted": general_count, "duplicate_cloudwatch_events": sql_duplicates, "unparsed_records": len(unparsed), "collection_status": collection.get("collection_status", "unknown")},
+        "coverage": {"notes": notes, "audit_cloudwatch_events": audit_envelopes, "general_log_events_not_counted": general_count, "duplicate_cloudwatch_events": sql_duplicates, "unparsed_records": len(unparsed), "collection_status": collection.get("collection_status", "unknown"), "filtered_management": filtered_management, "filtered_queries": filtered_queries, "filtered_auxiliary": filtered_auxiliary, "unclassified": unclassified},
         "unparsed": unparsed,
     }
 
@@ -399,70 +506,10 @@ def _json(value):
 
 
 def generate_html(report: dict) -> str:
-    meta = report["metadata"]
-    custom = meta.get("period_kind", "daily") == "custom"
-    title = "RDS 操作审计报告" if custom else "RDS 操作审计日报"
-    date_label = "自定义时间窗口 · 窗口结束日期" if custom else "报告日期"
-    cards = []
-    for category, css_class in (("新增", "create"), ("删除", "delete"), ("修改", "modify")):
-        parts = [f"{_e(source['label'])} {int(source['counts'].get(category, 0))}" for source in report["by_source"].values()]
-        cards.append(f'<div class="card {css_class}"><span>{category}</span><strong>{int(meta["counts"].get(category, 0))}</strong><small>{" · ".join(parts)}</small></div>')
-    badges = '<span class="badge">采集步骤完成</span>' if meta["complete"] else '<span class="badge error">采集或解析不完整</span>'
-    if meta.get("example_data"):
-        badges += ' <span class="badge demo">虚构示例，非真实账号数据</span>'
-    elif meta.get("offline"):
-        badges += ' <span class="badge demo">离线输入，未向 AWS 验证</span>'
-    source_rows = []
-    for source in report["by_source"].values():
-        cells = "".join(f'<td class="number">{int(source["counts"][category])}</td>' for category in CATEGORIES)
-        source_rows.append(f'<tr><td>{_e(source["label"])}</td>{cells}<td class="number">{source["failed"]}</td><td class="number">{source["total"]}</td></tr>')
-    actor_summary = []
-    for actor in report["actors"]:
-        cells = "".join(f'<td class="number">{int(actor["counts"][category])}</td>' for category in CATEGORIES[:3])
-        actor_summary.append(f'<tr><td><a href="#{actor["anchor"]}">{_e(actor["actor"])}</a><br><small>{_e(actor["actor_type"])}</small></td><td>{_e(SOURCE_LABELS[actor["source_kind"]])}</td>{cells}<td class="number">{actor["failed"]}</td><td class="number">{actor["total"]}</td></tr>')
-    grouped = defaultdict(list)
-    for row in report["events"]:
-        grouped[row["actor_key"]].append(row)
-    operations = []
-    for actor in report["actors"]:
-        rows = []
-        for row in grouped[actor["actor_key"]]:
-            details = {"记录ID": row["event_id"], "身份": row.get("identity"), "时间来源": row.get("timestamp_source", "CloudTrail eventTime"), "原日志时间": row.get("timestamp_raw", ""), "日志组": row.get("log_group", ""), "日志流": row.get("log_stream", ""), "请求参数": row.get("parameters"), "响应": row.get("response"), "错误码": row.get("error_code", ""), "错误信息": row.get("error_message", ""), "UserAgent": row.get("user_agent", "")}
-            description = _e(row.get("description") or row["event_name"])
-            if row.get("sql"):
-                description = f'<pre>{description}</pre>'
-            resource = "<br>".join(_e(item) for item in row.get("resources", [])) or "—"
-            result_class = ' class="failed"' if row["status"] == "failed" else ""
-            rows.append(f'<tr{result_class}><td class="time nowrap">{_e(row["time_local"])}</td><td><span class="chip">{_e(row["category"])}</span></td><td class="operation">{description}<details><summary>身份与操作参数</summary><pre>{_json(details)}</pre></details></td><td class="resource">{resource}</td><td>{_e(row["source_ip"]) or "—"}<br><small>{_e(row["region"])}</small></td><td>{_e(row["result"])}</td></tr>')
-        operations.append(f'<div class="actor-block" id="{actor["anchor"]}"><h3>{_e(actor["actor"])}</h3><div class="actor-meta muted">{_e(actor["actor_type"])} · {_e(SOURCE_LABELS[actor["source_kind"]])} · {actor["total"]} 条记录</div><div class="scroll"><table class="operations"><thead><tr><th>北京时间</th><th>分类</th><th>操作信息</th><th>资源 / 数据库</th><th>来源 / 区域</th><th>请求结果</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div></div>')
-    coverage_notes = "".join(f"<li>{_e(note)}</li>" for note in report["coverage"]["notes"])
-    errors = ""
-    if meta["errors"]:
-        errors = f'<div class="notice error">存在 {len(meta["errors"])} 项采集或解析失败，当前数量仅包含已取得的记录。请检查并补跑。</div><details><summary>查看失败范围</summary><pre>{_json(meta["errors"])}</pre></details>'
-    unparsed = ""
-    if report.get("unparsed"):
-        unparsed = f'<details><summary>查看未解析审计记录（{len(report["unparsed"])} 条，未纳入操作计数）</summary><pre>{_json(report["unparsed"])}</pre></details>'
-    css_version = hashlib.sha256(CSS.encode()).hexdigest()[:12]
-    empty = '<p class="empty">当前范围没有取得操作记录，请同时核对采集状态和 SQL 审计覆盖。</p>'
-    return f'''<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(meta["audit_date"])} {_e(title)}</title><link rel="stylesheet" href="rds-report.css?v={css_version}"></head>
-<body><main><header><div class="topline"><div><h1>{_e(title)}</h1><div class="muted">{_e(date_label)} {_e(meta["audit_date"])} · AWS 账号 {_e(meta["account_id"])}</div></div><div>{badges}</div></div><p class="window">北京时间 {_e(local_time(meta["window_start_utc"]))} 至 {_e(local_time(meta["window_end_utc_exclusive"]))}（左闭右开）<br><small>生成于 {_e(local_time(meta["generated_at"]))}（北京时间）</small></p></header>
-<div class="cards">{"".join(cards)}</div><p class="fine">增删改按未报错的请求 / 语句计数；不等于影响行数或最终提交结果。共 {meta["total"]} 条明细，其中失败 {meta["failed_or_partial"]} 条。</p>
-<section><h2>按来源汇总</h2><div class="scroll"><table><thead><tr><th>来源</th><th>新增</th><th>删除</th><th>修改</th><th>其他未报错记录</th><th>失败记录</th><th>全部明细</th></tr></thead><tbody>{"".join(source_rows)}</tbody></table></div><p class="fine">SQL 的连接、表访问等辅助事件只列明细，不加入语句汇总，因此汇总列之和可能小于全部明细。</p></section>
-<section><h2>按操作者汇总</h2><p class="muted">点击操作者查看对应明细；AWS 身份与数据库账号分别展示，角色会话名不等于真实人员姓名。</p><div class="scroll"><table><thead><tr><th>操作者</th><th>来源</th><th>新增</th><th>删除</th><th>修改</th><th>失败</th><th>明细数量</th></tr></thead><tbody>{"".join(actor_summary)}</tbody></table></div>{empty if not actor_summary else ""}</section>
-<section><h2>人员与操作明细</h2>{"".join(operations) or empty}</section>
-<section><h2>采集状态与统计口径</h2>{errors}<ul class="coverage-list">{coverage_notes}</ul>{unparsed}<p class="fine">本次 audit CloudWatch 事件 {report["coverage"]["audit_cloudwatch_events"]} 条；general 原文事件 {report["coverage"]["general_log_events_not_counted"]} 条（不重复计数）；未解析记录 {report["coverage"]["unparsed_records"]} 条。</p></section>
-</main></body></html>'''
+    from rds_report_pages import generate_overview
+    return generate_overview(report)
 
 
 def write_report(report: dict, directory: Path) -> Path:
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    filename = report["metadata"]["report_filename"]
-    if Path(filename).name != filename or not re.fullmatch(r"\d{4}-\d{2}-\d{2}-rds操作审计(?:-自定义窗口)?\.html", filename):
-        raise ValueError("unsafe report filename")
-    (directory / "daily-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (directory / "rds-report.css").write_text(CSS, encoding="utf-8")
-    path = directory / filename
-    path.write_text(generate_html(report), encoding="utf-8")
-    return path
+    from rds_report_pages import write_paginated_report
+    return write_paginated_report(report, directory)

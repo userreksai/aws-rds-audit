@@ -7,6 +7,8 @@ import os
 import sys
 import tempfile
 import unittest
+from deploy import run_collect as collect_runner
+from deploy import run_failure as failure_runner
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
@@ -62,12 +64,15 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(command[command.index("--publish-dir") + 1], "/srv/rds report")
         self.assertIn("--send-lark", command)
         self.assertIn("--daily", command)
+        self.assertIn("--from-cache", command)
+        self.assertEqual(command[command.index("--cache-dir") + 1], str(runner.PROJECT / "cache"))
+        self.assertEqual(command[command.index("--interval-minutes") + 1], "30")
 
     def test_precheck_needs_no_completed_window_and_keeps_default_role_chain(self):
         command = runner.build_command({}, check=True)
         self.assertIn("--check-config", command)
         self.assertIn("--send-lark", command)
-        for unwanted in ("--daily", "--date", "--profile", "--publish-dir"):
+        for unwanted in ("--daily", "--from-cache", "--collect-incremental", "--date", "--profile", "--publish-dir"):
             self.assertNotIn(unwanted, command)
 
     def test_precheck_does_not_create_reports_or_run_lock(self):
@@ -79,6 +84,61 @@ class EnvironmentTests(unittest.TestCase):
                 self.assertEqual(runner.main(["--check-config"]), 0)
             execute.assert_called_once()
             self.assertFalse(reports.exists())
+
+
+class IncrementalCommandTests(unittest.TestCase):
+    def test_collection_has_a_bounded_cache_schedule_and_keeps_profile_arguments(self):
+        command = collect_runner.build_command({
+            "AWS_PROFILE": "profile with spaces", "AWS_RDS_INTERVAL_MINUTES": "60",
+            "AWS_RDS_CACHE_DIR": "/private/cache with spaces", "AWS_RDS_MAX_BUCKETS_PER_RUN": "2",
+            "AWS_RDS_CACHE_LOOKBACK_HOURS": "30", "AWS_RDS_PUBLISH_DIR": "/web/rds report",
+        })
+        self.assertIn("--collect-incremental", command)
+        self.assertNotIn("--daily", command)
+        self.assertEqual(command[command.index("--interval-minutes") + 1], "60")
+        self.assertEqual(command[command.index("--cache-dir") + 1], "/private/cache with spaces")
+        self.assertEqual(command[command.index("--profile") + 1], "profile with spaces")
+        self.assertEqual(command[command.index("--max-buckets-per-run") + 1], "2")
+        self.assertIn("--send-lark", command)
+
+    def test_invalid_schedule_values_fail_before_starting_a_collector(self):
+        for values in ({"AWS_RDS_INTERVAL_MINUTES": "5"}, {"AWS_RDS_MAX_BUCKETS_PER_RUN": "0"}, {"AWS_RDS_CACHE_LOOKBACK_HOURS": "-1"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                collect_runner.build_command(values)
+
+    def test_collection_runner_does_not_execute_a_shell_or_send_messages_itself(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "rds_audit.py").write_text("# fake\n", encoding="utf-8")
+            with patch.object(collect_runner, "PROJECT", project), patch.dict(os.environ, {}, clear=True), patch.object(collect_runner.subprocess, "run", return_value=Mock(returncode=2)) as execute:
+                self.assertEqual(collect_runner.main([]), 2)
+            arguments, kwargs = execute.call_args
+            self.assertIsInstance(arguments[0], list)
+            self.assertNotIn("shell", kwargs)
+            self.assertIn("--collect-incremental", arguments[0])
+
+
+class FailureNotificationTests(unittest.TestCase):
+    def test_failure_runner_only_requests_durable_notification(self):
+        command = failure_runner.build_command({"AWS_PROFILE": "audit profile", "AWS_RDS_CACHE_DIR": "/private/cache path", "AWS_RDS_INTERVAL_MINUTES": "60"}, "aws-rds-audit-collect.service")
+        self.assertIn("--notify-service-failure", command)
+        self.assertEqual(command[command.index("--source-service") + 1], "aws-rds-audit-collect.service")
+        self.assertEqual(command[command.index("--profile") + 1], "audit profile")
+        self.assertEqual(command[command.index("--cache-dir") + 1], "/private/cache path")
+        self.assertIn("--send-lark", command)
+        self.assertNotIn("--daily", command)
+        self.assertNotIn("--collect-incremental", command)
+
+    def test_unknown_failure_source_is_rejected(self):
+        with self.assertRaises(ValueError):
+            failure_runner.build_command({}, "unrelated.service")
+
+    def test_failure_runner_uses_argv_without_shell_and_returns_notifier_status(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(failure_runner.subprocess, "run", return_value=Mock(returncode=2)) as execute:
+            self.assertEqual(failure_runner.main(["aws-rds-audit.service"]), 2)
+        arguments, kwargs = execute.call_args
+        self.assertEqual(arguments[0][arguments[0].index("--source-service") + 1], "aws-rds-audit.service")
+        self.assertNotIn("shell", kwargs)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "flock integration requires Linux")
@@ -122,6 +182,15 @@ class TimerContractTests(unittest.TestCase):
         self.assertIn("OnCalendar=*-*-* 08:10:00 Asia/Shanghai", text)
         self.assertIn("Persistent=true", text)
         self.assertIn("RandomizedDelaySec=0", text)
+
+    def test_collection_wakeup_is_every_five_minutes_without_changing_daily_time(self):
+        text = (ROOT / "deploy/aws-rds-audit-collect.timer").read_text(encoding="utf-8")
+        self.assertIn("OnCalendar=*-*-* *:00/5:00 Asia/Shanghai", text)
+        self.assertIn("Persistent=true", text)
+        self.assertIn("Unit=aws-rds-audit-collect.service", text)
+        installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("--interval-minutes", installer)
+        self.assertIn("systemctl enable --now aws-rds-audit-collect.timer aws-rds-audit.timer", installer)
 
 
 if __name__ == "__main__":

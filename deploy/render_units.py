@@ -31,9 +31,7 @@ def working_directory(value: str) -> str:
     return value.replace("%", "%%")
 
 
-def render_units(project_root: str, username: str, group: str, home: str, *, minute="10") -> tuple[str, str]:
-    if minute not in {"05", "10"}:
-        raise ValueError("Execution minute must be 05 or 10")
+def _render_service(project_root, username, group, home, template, runner):
     for value in (username, group):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+\$?", value):
             raise ValueError("Service user and group must be local account names")
@@ -45,18 +43,42 @@ def render_units(project_root: str, username: str, group: str, home: str, *, min
         "@PROJECT_ROOT@": scalar_path,
         "@HOME_ENV@": quote_word("HOME=" + home),
         "@PYTHON@": quote_word(str(PurePosixPath(root) / ".venv/bin/python")),
-        "@RUNNER@": quote_word(str(PurePosixPath(root) / "deploy/run_daily.py")),
+        "@RUNNER@": quote_word(str(PurePosixPath(root) / "deploy" / runner)),
     }
-    service = (templates / "aws-rds-audit.service").read_text(encoding="utf-8")
+    service = (templates / template).read_text(encoding="utf-8")
     for key, value in replacements.items():
         service = service.replace(key, value)
+    return service
+
+
+def render_units(project_root: str, username: str, group: str, home: str, *, minute="10") -> tuple[str, str]:
+    if minute not in {"05", "10"}:
+        raise ValueError("Execution minute must be 05 or 10")
+    templates = Path(__file__).resolve().parent
+    service = _render_service(project_root, username, group, home, "aws-rds-audit.service", "run_daily.py")
     timer = (templates / "aws-rds-audit.timer").read_text(encoding="utf-8").replace("08:10", "08:" + minute)
     return service, timer
 
 
+def render_collection_units(project_root: str, username: str, group: str, home: str) -> tuple[str, str]:
+    service = _render_service(project_root, username, group, home, "aws-rds-audit-collect.service", "run_collect.py")
+    timer = (Path(__file__).resolve().parent / "aws-rds-audit-collect.timer").read_text(encoding="utf-8")
+    return service, timer
+
+
+def render_failure_unit(project_root: str, username: str, group: str, home: str) -> str:
+    # %i belongs to systemd's instance syntax; only substituted filesystem paths
+    # are escaped, so the template can forward the actual failing unit name.
+    return _render_service(project_root, username, group, home, "aws-rds-audit-failure@.service", "run_failure.py")
+
+
 def write_units(destination: Path, project_root: str, username: str, group: str, home: str, *, minute="10"):
     service, timer = render_units(project_root, username, group, home, minute=minute)
-    for name, content in (("aws-rds-audit.service", service), ("aws-rds-audit.timer", timer)):
+    collect_service, collect_timer = render_collection_units(project_root, username, group, home)
+    failure = render_failure_unit(project_root, username, group, home)
+    for name, content in (("aws-rds-audit.service", service), ("aws-rds-audit.timer", timer),
+                          ("aws-rds-audit-collect.service", collect_service), ("aws-rds-audit-collect.timer", collect_timer),
+                          ("aws-rds-audit-failure@.service", failure)):
         path = Path(destination) / name
         path.write_text(content, encoding="utf-8")
         path.chmod(0o644)
