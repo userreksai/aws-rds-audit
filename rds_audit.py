@@ -323,10 +323,12 @@ class Collector:
             name = group["logGroupName"]
             if not re.fullmatch(r"/aws/rds/(instance|cluster)/[^/]+/(audit|general)", name):
                 continue
+            print(f"{region}: 已发现 SQL 日志组 {name}", flush=True)
             item = {key: group[key] for key in ("logGroupName", "retentionInDays", "storedBytes", "creationTime", "logGroupClass") if key in group}
             summary["sql_log_groups"].append(item)
             if not self.args.download_sql_logs:
                 item["download"] = {"status": "not_requested"}
+                print(f"{region}: {name} 仅列目录，未请求下载日志。", flush=True)
                 continue
             directory = self.directory / "cloudwatch"
             directory.mkdir(exist_ok=True)
@@ -346,6 +348,11 @@ class Collector:
                 item["download"]["status"] = "ok"
 
             self.check(f"{region}:download_cloudwatch:{name}", download)
+            if item["download"]["status"] == "ok":
+                count = item["download"]["event_count"]
+                print(f"{region}: {name} 已下载 {count} 条 CloudWatch 日志事件；文件 {path.resolve()}", flush=True)
+                if not count:
+                    print(f"{region}: 当前查询窗口未取得已保留的日志事件，不能据此判断没有 SQL 操作；请核对产生日志的时间与保留范围。", flush=True)
 
     def run(self):
         try:
@@ -450,6 +457,10 @@ def check_configuration(args):
             rds = c.client("rds", region)
             instances = list(iter_items(rds, "describe_db_instances", "DBInstances", MaxRecords=100))
             clusters = list(iter_items(rds, "describe_db_clusters", "DBClusters", MaxRecords=100))
+            mysql_instances = [item for item in instances if item["Engine"] in MYSQL_ENGINES]
+            mysql_clusters = [item for item in clusters if item["Engine"] in MYSQL_ENGINES]
+            if mysql_instances or mysql_clusters:
+                print(f"{region}: 已发现 MySQL/Aurora MySQL 实例 {len(mysql_instances)} 个、集群 {len(mysql_clusters)} 个。", flush=True)
             rds.describe_events(Duration=60, MaxRecords=20)
             for item in instances:
                 if item["Engine"] not in MYSQL_ENGINES:
@@ -465,9 +476,13 @@ def check_configuration(args):
             logs = c.client("logs", region)
             groups = list(iter_items(logs, "describe_log_groups", "logGroups", request_token="nextToken", response_token="nextToken", logGroupNamePrefix="/aws/rds/"))
             sql_groups = [g["logGroupName"] for g in groups if re.fullmatch(r"/aws/rds/(instance|cluster)/[^/]+/(audit|general)", g["logGroupName"])]
+            if groups:
+                print(f"{region}: 已发现 /aws/rds/ 日志组 {len(groups)} 个，其中 audit/general {len(sql_groups)} 个。", flush=True)
             for name in sql_groups:
+                print(f"{region}: 已发现 SQL 日志组 {name}，正在验证读取接口权限…", flush=True)
                 stamp = int(datetime.now(UTC).timestamp() * 1000)
                 logs.filter_log_events(logGroupName=name, startTime=stamp - 1, endTime=stamp, limit=1)
+                print(f"{region}: {name} 读取接口验证通过（预检不下载日志，也不判断历史日志是否有内容）。", flush=True)
             if not sql_groups:
                 print(f"{region}: 未发现audit/general日志组；无法在现有资源上验证SQL日志读取权限，也不代表已启用SQL审计。")
             if not any(i["Engine"] in MYSQL_ENGINES for i in instances + clusters):
@@ -570,6 +585,8 @@ def main(argv=None):
             base /= audit_date
         directory = base / (datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8])
         directory.mkdir(parents=True, exist_ok=False)
+        beijing = ZoneInfo("Asia/Shanghai")
+        print(f"采集窗口（北京时间）: {start.astimezone(beijing):%Y-%m-%d %H:%M:%S} 至 {end.astimezone(beijing):%Y-%m-%d %H:%M:%S}（左闭右开）", flush=True)
         collector = Collector(session, config, start, end, directory, args, identity)
         status = collector.run()
         print(f"结果: {directory.resolve()}")

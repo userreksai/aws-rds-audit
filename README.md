@@ -155,6 +155,21 @@ reports/<AWS账号ID>/<日报日期>/<运行目录>/
 
 Lark 复用项目的机器人通知模块，只发送日期、账号、北京时间范围、增删改数量、采集状态和已配置的详情链接，不发送 SQL 正文。未配置报告地址时应从服务器查看归档，不应把占位地址作为可用链接。预检只验证本地格式及 AWS 读取权限，不能证明远端机器人 token 有效；只有真实发送才能验证。
 
+## 已发现日志组但尚未下载日志
+
+安装器执行的是 `--check-config` 预检：它会打印匹配的 audit/general 日志组名称并验证读取接口，但不会下载或保存日志，也不能根据权限探针判断历史日志是否有内容。正式采集时才会输出窗口、每个日志组下载的 CloudWatch 事件数与文件位置；事件条数不等于 SQL 语句或受影响行数。
+
+首次启用定时器后，如果 `systemctl list-timers` 显示 `LAST -`，且服务日志为 `No entries`，请先确认尚未执行正式采集。要立即生成日报并发送汇总，可执行 `systemctl start aws-rds-audit.service`。
+
+例如香港区域的日志组 `/aws/rds/cluster/shenji/audit` 符合匹配规则；`error` 和 `RDSOSMetrics` 不属于 SQL audit/general，不纳入数据库增删改统计。单独检查香港近 24 小时的原始日志、且不发送 Lark：
+
+```bash
+cd /usr/local/aws-rds-shenji
+.venv/bin/python rds_audit.py --profile audit --regions ap-east-1 --days 1 --download-sql-logs --output-dir reports/ap-east-1-check
+```
+
+检查输出目录中的 `report.json`（`sql_log_groups` 下的 `download.status`、`event_count`）以及 `cloudwatch/*.jsonl`。当天日报截至北京时间 08:00；当天 08:00 后才产生的日志不属于该份日报，应检查上述最近 24 小时窗口或后续日报。日志组存在不代表其中一定已有 SQL 事件。
+
 ## 已有采集结果与演示
 
 已有运行目录可离线生成 HTML，使用该数据实际覆盖的日期与窗口：
