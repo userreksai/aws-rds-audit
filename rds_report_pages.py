@@ -12,7 +12,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 PAGE_SIZE = 100
 PREVIEW_SIZE = 20
-FORMAT_VERSION = "change-pages-v2"
+FORMAT_VERSION = "change-pages-v3"
 SHORT_LIMIT = 240
 SQL_LIMIT = 4096
 FIELD_LIMIT = 8192
@@ -188,7 +188,11 @@ def _actor_table(actors, *, prefix=""):
     for actor in actors:
         key = str(actor["actor_key"])
         cells = "".join(f'<td class="number">{int(actor.get("counts", {}).get(category, 0))}</td>' for category in ("新增", "删除", "修改"))
-        rows.append(f'<tr><td><a href="{_href(prefix + _actor_prefix(key) + "-000001.html")}">{_e(_text(actor.get("actor"), 120))}</a><br><small>{_e(actor.get("actor_type", ""))}</small><details class="actor-details"><summary>实例与身份</summary><div class="actor-context muted">{_e(_text(key, 600))}</div></details></td><td>{_e(_model().SOURCE_LABELS.get(actor.get("source_kind"), actor.get("source_kind", "")))}</td>{cells}<td class="number">{int(actor.get("failed", 0))}</td><td class="number">{int(actor.get("total", 0))}</td></tr>')
+        contexts = actor.get("contexts") or []
+        context_details = ''.join('<div class="actor-context muted">' + _e(_text(' · '.join(str(context.get(field) or '') for field in ('region', 'serverhost', 'database', 'log_group', 'log_stream') if context.get(field)) or context.get('actor_key'), 600)) + '</div>' for context in contexts[:10]) if contexts else '<div class="actor-context muted">' + _e(_text(key, 600)) + '</div>'
+        if len(contexts) > 10:
+            context_details += f'<small>共 {len(contexts)} 项上下文，完整内容见服务器归档。</small>'
+        rows.append(f'<tr><td><a href="{_href(prefix + _actor_prefix(key) + "-000001.html")}">{_e(_text(actor.get("actor"), 120))}</a><br><small>{_e(actor.get("actor_type", ""))}</small><details class="actor-details"><summary>实例与身份</summary>{context_details}</details></td><td>{_e(_model().SOURCE_LABELS.get(actor.get("source_kind"), actor.get("source_kind", "")))}</td>{cells}<td class="number">{int(actor.get("failed", 0))}</td><td class="number">{int(actor.get("total", 0))}</td></tr>')
     columns = '<colgroup><col class="actor-label"><col class="actor-source">' + '<col class="summary-number">' * 5 + '</colgroup>'
     return '<div class="scroll"><table class="summary-table actor-summary">' + columns + '<thead><tr><th>操作者 / 实例上下文</th><th>来源</th><th class="number">新增</th><th class="number">删除</th><th class="number">修改</th><th class="number">失败</th><th class="number">明细数量</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>' if rows else '<p class="empty">当前未取得可展示的增删改操作者。</p>'
 
@@ -270,7 +274,7 @@ def write_paginated_report(report: dict, directory: Path) -> Path:
     categories = {"create": [], "delete": [], "modify": []}
     category_keys = {"新增": "create", "删除": "delete", "修改": "modify"}
     for index, row in enumerate(events):
-        actor_indices[str(row.get("actor_key", "unknown"))].append(index)
+        actor_indices[str(row.get("actor_group_key") or row.get("actor_key", "unknown"))].append(index)
         if row.get("status") == "failed":
             failed.append(index)
         if row.get("category") in category_keys:

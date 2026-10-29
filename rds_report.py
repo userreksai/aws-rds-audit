@@ -444,14 +444,19 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
     attempted = dict.fromkeys(CATEGORIES, 0)
     by_source = {kind: {"label": label, "total": 0, "failed": 0, "counted_total": 0, "counts": dict.fromkeys(CATEGORIES, 0), "attempted_counts": dict.fromkeys(CATEGORIES, 0)} for kind, label in SOURCE_LABELS.items()}
     actor_rows = {}
+    actor_contexts = defaultdict(dict)
     for row in events:
         source = by_source[row["source_kind"]]
         source["total"] += 1
         source["failed"] += row["status"] == "failed"
         attempted[row["category"]] += 1
         source["attempted_counts"][row["category"]] += 1
-        key = row["actor_key"]
+        key = "sql:username:" + row["actor"] if row["source_kind"] == "sql" else row["actor_key"]
+        row["actor_group_key"] = key
         actor_row = actor_rows.setdefault(key, {"actor": row["actor"], "actor_key": key, "actor_type": row["actor_type"], "source_kind": row["source_kind"], "total": 0, "failed": 0, "counts": dict.fromkeys(CATEGORIES, 0), "anchor": "actor-" + hashlib.sha256(key.encode()).hexdigest()[:16]})
+        context = {name: row.get(name) for name in ("actor_key", "region", "serverhost", "database", "log_group", "log_stream") if row.get(name)}
+        context_key = (row["actor_key"], row.get("region", ""), row.get("database", ""))
+        actor_contexts[key].setdefault(context_key, context)
         actor_row["total"] += 1
         actor_row["failed"] += row["status"] == "failed"
         if row["counted"]:
@@ -459,9 +464,12 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
             source["counts"][row["category"]] += 1
             source["counted_total"] += 1
             actor_row["counts"][row["category"]] += 1
+    for key, actor_row in actor_rows.items():
+        actor_row["contexts"] = [actor_contexts[key][context] for context in sorted(actor_contexts[key])]
     notes = [
         "新增、删除、修改统计的是日志中未报错的 API 请求或 SQL 语句条数，不是受影响行数。失败请求保留在明细和失败数量中，不计入成功返回的增删改。",
         "API 未报错不保证异步变更最终完成；SQL 返回码 0 不证明事务最终 COMMIT。两种来源分别汇总，共用数据库账号不能推定真实人员。",
+        "同名数据库账号跨实例、日志流合并汇总，具体实例信息保留在明细；账号名称区分大小写，AWS 身份与数据库账号分别统计。",
         "主报告仅保留可识别的新增、删除、修改；只读管理 API、SELECT 等查询、连接及 TABLE 辅助记录不进入明细。general 日志不参与增删改统计，避免与 audit 重复计数。",
         "复杂 WITH、CALL、PREPARE、EXECUTE、包含内部分号的语句及无法解析的记录独立保留为待核查证据，不冒充只读，也不计入增删改数量。",
         "无日志不等于无 SQL 操作：审计可能未启用、被用户/事件过滤、延迟、截断或超过保留期。当前配置不能证明历史覆盖完整。",

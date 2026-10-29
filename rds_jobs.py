@@ -45,7 +45,9 @@ class OpsOutbox:
             CREATE TABLE IF NOT EXISTS incidents(key TEXT PRIMARY KEY, generation INTEGER, is_open INTEGER, last_notice INTEGER);
             CREATE TABLE IF NOT EXISTS notices(id TEXT PRIMARY KEY, scope TEXT, payload TEXT, status TEXT, attempts INTEGER DEFAULT 0, next_attempt INTEGER DEFAULT 0, last_error TEXT);
             CREATE TABLE IF NOT EXISTS daily_requests(scope TEXT, day TEXT, requested_at INTEGER, PRIMARY KEY(scope,day));
+            CREATE TABLE IF NOT EXISTS quality_state(scope TEXT, account TEXT, notified_fingerprint TEXT NOT NULL DEFAULT '', PRIMARY KEY(scope,account));
         """)
+        self.cancel_legacy_quality_recoveries()
 
     def close(self):
         self.db.close()
@@ -72,12 +74,13 @@ class OpsOutbox:
             old = self.db.execute("SELECT * FROM incidents WHERE key=?", (key,)).fetchone()
             generation = int(old["generation"]) + 1 if old and not old["is_open"] else int(old["generation"]) if old else 1
             if old and old["is_open"] and stamp - old["last_notice"] < 3600:
-                return
+                return False
             self.db.execute("INSERT OR REPLACE INTO incidents VALUES(?,?,1,?)", (key, generation, stamp))
             payload = {**payload, "message": _safe_message(payload.get("message", "")), "regions": self.scope["regions"], "occurred_at": now.isoformat()}
             identifier = f"{key}:{generation}:failed:{stamp//3600}"
             payload["event_id"] = identifier
             self.db.execute("INSERT OR IGNORE INTO notices(id,scope,payload,status) VALUES(?,?,?,'pending')", (identifier, self.scope_id, json.dumps(payload, ensure_ascii=False)))
+        return True
 
     def recovery(self, key, payload, now):
         key = self.scope_id + ":" + key
@@ -93,11 +96,76 @@ class OpsOutbox:
             payload["event_id"] = identifier
             self.db.execute("INSERT OR IGNORE INTO notices(id,scope,payload,status) VALUES(?,?,?,'pending')", (identifier, self.scope_id, json.dumps(payload, ensure_ascii=False)))
 
-    def flush(self, callback, now):
+    def cancel_legacy_quality_recoveries(self):
+        """Old recovery notices were based on unrelated successful segments."""
+        expression = re.compile(re.escape(self.scope_id + ":quality:") + r"\d+:recovered$")
+        with self.db:
+            rows = self.db.execute("SELECT id FROM notices WHERE scope=? AND status='pending'", (self.scope_id,)).fetchall()
+            self.db.executemany("UPDATE notices SET status='cancelled' WHERE id=?", ((row["id"],) for row in rows if expression.fullmatch(row["id"])))
+
+    def sync_quality(self, store, now):
+        """Track committed problem snapshots, across collection rounds/restarts."""
+        quality = store.quality_status()
+        account = str(store.account_id)
+        key = "quality:" + account
+        full_key = self.scope_id + ":" + key
+        unresolved = quality["problem_segments"] + quality["unknown_segments"]
+        state = self.db.execute("SELECT * FROM quality_state WHERE scope=? AND account=?", (self.scope_id, account)).fetchone()
+        self.cancel_legacy_quality_recoveries()
+        if state is None:
+            # Adopt the legacy account's incident without opening another cycle
+            # or immediately repeating a notification the operator already saw.
+            legacy_key = self.scope_id + ":quality"
+            legacy = self.db.execute("SELECT * FROM incidents WHERE key=?", (legacy_key,)).fetchone()
+            expression = re.compile(re.escape(legacy_key) + r":\d+:(?:failed:\d+|recovered)$")
+            notices = []
+            for row in self.db.execute("SELECT * FROM notices WHERE scope=? ORDER BY rowid DESC", (self.scope_id,)):
+                if expression.fullmatch(row["id"]):
+                    payload = json.loads(row["payload"])
+                    if str(payload.get("account_id")) == account:
+                        notices.append(row)
+            notified = ""
+            with self.db:
+                if legacy and notices:
+                    current_prefix = legacy_key + ":" + str(legacy["generation"]) + ":failed:"
+                    already_sent = any(row["status"] == "sent" and row["id"].startswith(current_prefix) for row in notices)
+                    opened = bool(unresolved or legacy["is_open"])
+                    last_notice = legacy["last_notice"] if already_sent else 0
+                    self.db.execute("INSERT OR IGNORE INTO incidents VALUES(?,?,?,?)", (full_key, legacy["generation"], int(opened), last_notice))
+                    self.db.execute("UPDATE incidents SET is_open=0 WHERE key=?", (legacy_key,))
+                    self.db.executemany("UPDATE notices SET status='cancelled' WHERE id=? AND status='pending'", ((row["id"],) for row in notices))
+                    if unresolved and already_sent:
+                        notified = quality["fingerprint"]
+                self.db.execute("INSERT INTO quality_state VALUES(?,?,?)", (self.scope_id, account, notified))
+            state = {"notified_fingerprint": notified}
+        if unresolved:
+            # A queued recovery must not be delivered after another problem is
+            # already known. All quality notices for this account are reconciled
+            # before their outbox is flushed.
+            expression = re.compile(re.escape(full_key) + r":\d+:recovered$")
+            with self.db:
+                rows = self.db.execute("SELECT id FROM notices WHERE scope=? AND status='pending'", (self.scope_id,)).fetchall()
+                self.db.executemany("UPDATE notices SET status='cancelled' WHERE id=?", ((row["id"],) for row in rows if expression.fullmatch(row["id"])))
+            if quality["fingerprint"] != state["notified_fingerprint"] or not self.is_open(key):
+                segments = quality["segments"]
+                payload = {"kind": "quality_partial", "account_id": account,
+                           "bucket_start": min((row["start"] for row in segments), default=None),
+                           "bucket_end": max((row["end"] for row in segments), default=None),
+                           "message": f"当前累计 {quality['problem_segments']} 个分段含无法识别SQL，另 {quality['unknown_segments']} 个分段质量状态无法确认。问题证据已保留，未识别记录不计入增删改；仅原问题分段通过质量检查后才恢复。请查看质量问题页。"}
+                if self.failure(key, payload, now):
+                    with self.db:
+                        self.db.execute("UPDATE quality_state SET notified_fingerprint=? WHERE scope=? AND account=?", (quality["fingerprint"], self.scope_id, account))
+        else:
+            self.recovery(key, {"account_id": account, "message": "此前问题分段的当前成功快照均已通过质量检查，未解决质量分段数为0；历史隔离归档仍保留供核查。"}, now)
+            with self.db:
+                self.db.execute("UPDATE quality_state SET notified_fingerprint=? WHERE scope=? AND account=?", (quality["fingerprint"], self.scope_id, account))
+        return quality
+
+    def flush(self, callback, now, *, include_quality=True):
         if callback is not None:
             with _exclusive(self.lock) as locked:
                 if locked:
-                    rows = self.db.execute("SELECT * FROM notices WHERE scope=? AND status='pending' AND next_attempt<=? ORDER BY rowid LIMIT 30", (self.scope_id, int(now.timestamp()))).fetchall()
+                    rows = self.db.execute("SELECT * FROM notices WHERE scope=? AND status='pending' AND next_attempt<=? AND (? OR id NOT LIKE ?) ORDER BY rowid LIMIT 30", (self.scope_id, int(now.timestamp()), int(include_quality), self.scope_id + ":quality:%")).fetchall()
                     for row in rows:
                         try:
                             result = callback(json.loads(row["payload"]))
@@ -110,7 +178,7 @@ class OpsOutbox:
                         else:
                             self.db.execute("UPDATE notices SET status='sent',attempts=attempts+1,last_error=NULL WHERE id=?", (row["id"],))
                         self.db.commit()
-        return self.db.execute("SELECT count(*) FROM notices WHERE scope=? AND status='pending'", (self.scope_id,)).fetchone()[0]
+        return self.db.execute("SELECT count(*) FROM notices WHERE scope=? AND status='pending' AND (? OR id NOT LIKE ?)", (self.scope_id, int(include_quality), self.scope_id + ":quality:%")).fetchone()[0]
 
 
 def _notifier(config, *, sleep=time.sleep):
@@ -160,14 +228,14 @@ def run_incremental(args, *, api=None, now=None):
     try:
         config = api.lark_configuration(args)
         notify = _notifier(config)
-        ops.flush(notify, now)
+        ops.cancel_legacy_quality_recoveries()
+        ops.flush(notify, now, include_quality=False)
         session, sdk_config, identity = api.aws_session(args)
         ops.recovery("identity", {"account_id": identity["Account"], "message": "AWS身份和增量采集入口已恢复。"}, now)
         store = CacheStore(args.cache_dir, identity["Account"], scope)
         if not locks.enter_context(_exclusive(store.directory / ".job.lock")):
             print("已有采集或日报任务运行，本次跳过；后续定时器会继续处理。", flush=True)
             return 0
-        quality_windows = []
 
         def collect(start, end, target):
             light = argparse.Namespace(**vars(args))
@@ -178,17 +246,14 @@ def run_incremental(args, *, api=None, now=None):
             errors = [item for item in collector.report["checks"] if item["status"] == "error"]
             transport_errors = [item for item in errors if item.get("error_type") != "UnclassifiedSqlRecords"]
             quality = bool(errors) and not transport_errors
-            if quality:
-                quality_windows.append((start, end))
             return {"status": 2 if transport_errors else 0, "success": not transport_errors, "quality_partial": quality, "path": str(target), "error": "; ".join(_safe_message(item.get("message", "")) for item in transport_errors)[:1200]}
 
         stats = store.run_due(now, collect, notify, max_buckets=args.max_buckets_per_run, lookback_hours=args.cache_lookback_hours)
         if not stats.get("busy") and not stats.get("failed"):
             ops.recovery("service:aws-rds-audit-collect.service", {"account_id": identity["Account"], "message": "增量采集进程已恢复运行；数据完整性请查看分段状态和日报。"}, now)
-        if quality_windows:
-            ops.failure("quality", {"kind": "quality_partial", "account_id": identity["Account"], "bucket_start": api.iso(quality_windows[0][0]), "bucket_end": api.iso(quality_windows[-1][1]), "message": f"本轮 {len(quality_windows)} 个读取成功的分段含无法识别SQL，已独立留档且不计入增删改；不会因此反复拉取同一段，请查看质量问题页。"}, now)
-        elif stats.get("succeeded"):
-            ops.recovery("quality", {"account_id": identity["Account"], "message": "本轮成功分段未出现新的解析问题；历史隔离记录仍保留供核查。"}, now)
+        quality = ops.sync_quality(store, now)
+        stats["quality_unresolved_segments"] = quality["problem_segments"]
+        stats["quality_unknown_segments"] = quality["unknown_segments"]
         ops.flush(notify, now)
         print("增量采集: " + json.dumps(stats, ensure_ascii=False), flush=True)
         # Late arrivals or a recovered gap must be reflected in an already issued daily report.
@@ -209,7 +274,7 @@ def run_incremental(args, *, api=None, now=None):
         return 2 if stats.get("failed") or stats.get("pending_alerts") or pending else 0
     except Exception as exc:
         ops.failure("identity", {"kind": "collection_start_failure", "message": _safe_message(exc)}, now)
-        ops.flush(notify, now)
+        ops.flush(notify, now, include_quality=False)
         print("增量采集未完成，状态及告警已保留: " + _safe_message(exc), file=sys.stderr)
         return 2
     finally:
@@ -264,7 +329,7 @@ def run_cached_daily(args, *, api=None, now=None):
                 ops.recovery("delivery:" + day, {"account_id": store.account_id, "message": "日报发布/通知步骤已恢复。"}, now)
             ops.recovery("service:aws-rds-audit.service", {"account_id": store.account_id, "message": "日报进程已恢复运行；数据完整性以报告覆盖状态为准。"}, now)
             ops.recovery("daily-config:" + day, {"account_id": store.account_id, "message": "日报缓存配置已恢复。"}, now)
-            pending = ops.flush(notify, now)
+            pending = ops.flush(notify, now, include_quality=False)
             return 2 if status == 2 or pending else status
     except Exception as exc:
         if store is not None:
@@ -277,7 +342,7 @@ def run_cached_daily(args, *, api=None, now=None):
             except Exception:
                 pass  # The durable operations incident also requests a daily retry.
         ops.failure("daily-config:" + day, {"kind": "daily_cache_failure", "message": _safe_message(exc)}, now)
-        ops.flush(notify, now)
+        ops.flush(notify, now, include_quality=False)
         print("本地缓存日报未完成: " + _safe_message(exc), file=sys.stderr)
         return 2
     finally:
@@ -309,6 +374,6 @@ def notify_service_failure(args, *, api=None, now=None):
         return 2
     try:
         ops.failure("service:" + args.source_service, payload, now)
-        return 2 if ops.flush(_notifier(config), now) else 0
+        return 2 if ops.flush(_notifier(config), now, include_quality=False) else 0
     finally:
         ops.close()
