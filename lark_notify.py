@@ -141,6 +141,8 @@ def build_lark_payloads(report, config, *, access_password=None):
         lines.append("【离线归档输入，未向AWS验证覆盖】")
     if not meta.get("complete", False):
         lines.append("【采集或解析不完整，请检查报告并补跑】")
+    if meta.get("period_kind") == "custom":
+        lines.append("窗口类型：自定义时间窗口报告")
     lines.append("新增：{}　删除：{}　修改：{}".format(*(int(counts.get(key, 0)) for key in ("新增", "删除", "修改"))))
     lines.append("口径：未报错的API调用与SQL语句记录；不等于最终资源状态或事务提交。")
     for key, label in (("management", "RDS管理API"), ("sql", "数据库SQL审计")):

@@ -4,6 +4,8 @@
 
 日报固定使用北京时间（Asia/Shanghai）：**前一日 07:00 至当日 08:00，共 25 小时**；每天 **08:10** 由 systemd timer 执行。相邻两天报告有意重叠 07:00 至 08:00 的一小时，不能直接将多天总数相加作为去重统计。查询使用左闭右开窗口，08:00 整的记录由之后覆盖该时刻的窗口收录。
 
+自定义时间窗口也会自动生成 HTML：`--days`、`--start` / `--end` 或默认最近 7 天采集结束后，输出按真实窗口汇总的报告，不需要再加 `--daily`。已有下载目录可直接离线生成 HTML，无需重新请求 AWS 或重新下载日志。
+
 ## 记录与计数
 
 | 数据来源 | 报告内容 | 计数边界 |
@@ -127,6 +129,8 @@ EC2 IAM Role 省略 --profile audit。只生成报告时省略 --send-lark。Win
 
 手动指定的窗口尚未结束时会拒绝，不会缩短窗口冒充完整日报。--daily 不能和原始采集模式的 --days、--start、--end 混用。日报会下载当前可见的标准 CloudWatch audit / general 日志；不会自动改变数据库的审计配置。
 
+自定义窗口使用 `--days` 或 `--start` / `--end`，自动输出 HTML、`daily-report.json` 和 CSS。需要 SQL 明细时保留 `--download-sql-logs`；只列日志目录的采集不会凭空生成 SQL 明细。显式自定义窗口也可搭配 `--send-lark` 或 `--publish-dir`，仅在明确提供这些开关时执行推送或发布。
+
 ## HTML、归档与 Lark
 
 每次采集使用独立运行目录，保留原始证据和日报。下面对应显式设置 --output-dir reports；未指定时父目录默认为 reports/rds：
@@ -141,6 +145,8 @@ reports/<AWS账号ID>/<日报日期>/<运行目录>/
   YYYY-MM-DD-rds操作审计.html          中文 HTML 日报
   rds-report.css                      报告样式
 ~~~
+
+自定义窗口的运行目录不增加日报日期层，HTML 文件名为 `YYYY-MM-DD-rds操作审计-自定义窗口.html`。标题和页面显示真实起止时间，不套用固定日报的 25 小时窗口或跨日报重叠说明；原始 JSONL 仍然保留。
 
 报告按“总览 → 操作者 → 具体操作”排列，包含北京时间、身份或数据库账号、增删改分类、操作内容、资源、区域、来源 IP 和结果。SQL 可能含业务值，报告应保存在受控位置。查看日期 HTML 时保留同目录的 rds-report.css。
 
@@ -168,11 +174,22 @@ cd /usr/local/aws-rds-shenji
 .venv/bin/python rds_audit.py --profile audit --regions ap-east-1 --days 1 --download-sql-logs --output-dir reports/ap-east-1-check
 ```
 
-检查输出目录中的 `report.json`（`sql_log_groups` 下的 `download.status`、`event_count`）以及 `cloudwatch/*.jsonl`。当天日报截至北京时间 08:00；当天 08:00 后才产生的日志不属于该份日报，应检查上述最近 24 小时窗口或后续日报。日志组存在不代表其中一定已有 SQL 事件。
+这条命令会自动生成最近 24 小时的 HTML 汇总。也可检查输出目录中的 `report.json`（`sql_log_groups` 下的 `download.status`、`event_count`）以及 `cloudwatch/*.jsonl`。当天日报截至北京时间 08:00；当天 08:00 后才产生的日志不属于该份日报，应检查上述最近 24 小时窗口或后续日报。日志组存在不代表其中一定已有 SQL 事件。下载的 CloudWatch 事件数量不等于最终增删改条数，解析失败的记录会保留证据并将报告标记为不完整。
 
 ## 已有采集结果与演示
 
-已有运行目录可离线生成 HTML，使用该数据实际覆盖的日期与窗口：
+已有运行目录可离线生成 HTML。未指定 `--daily` 或 `--date` 时，按 `report.json` 中存储的完整原始时间窗口汇总；新的采集元数据若含 `period_kind`，保留其 daily/custom 类型，旧目录没有该字段时按自定义窗口处理。此过程不连接 AWS，不重新下载日志，也不修改已有原始 JSONL。
+
+例如已经下载了 40,510 条 CloudWatch 事件的香港目录，可以直接执行：
+
+```bash
+cd /usr/local/aws-rds-shenji
+.venv/bin/python rds_audit.py --input-dir reports/ap-east-1-check/796973492024/20261029T093255Z-20ece9a5
+```
+
+该目录的实际窗口为北京时间 2026-10-28 17:32:55 至 2026-10-29 17:32:55。这里不要加 `--date` 或 `--daily`，否则会改为要求原始数据覆盖指定的固定日报窗口。40,510 是下载事件数，增删改计数仍以可解析、未报错的 API/SQL 记录为准，不能直接用下载事件数代替。
+
+确实需要从已有数据生成某天的固定日报时，显式指定日期；原目录必须完整覆盖该 25 小时窗口：
 
 ~~~bash
 .venv/bin/python rds_audit.py --input-dir reports/<账号>/<日报日期>/<运行目录> --date 2026-10-29

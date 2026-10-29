@@ -181,6 +181,46 @@ class ReportFixture(unittest.TestCase):
         self.assertEqual(saved["metadata"]["counts"], result["metadata"]["counts"])
         self.assertIn("2026-10-28 07:00:00", target.read_text(encoding="utf-8"))
 
+    def test_custom_24_hour_window_keeps_exact_boundaries_and_custom_report_identity(self):
+        start = datetime(2026, 10, 28, 9, 32, 55, tzinfo=UTC)
+        end = start + timedelta(hours=24)
+        self.save([
+            management("start", eventTime=report.iso(start)),
+            management("end", eventTime=report.iso(end)),
+        ], [
+            audit_event("UPDATE t SET x=1", when=start, event_id="sql-start"),
+            audit_event("DELETE FROM t", when=end, event_id="sql-end"),
+        ])
+        result = report.build_daily_report(self.directory, audit_date="2026-10-29", start=start, end=end, offline=True, period_kind="custom")
+        meta = result["metadata"]
+        self.assertEqual(meta["period_kind"], "custom")
+        self.assertEqual(meta["period_label"], "自定义时间窗口")
+        self.assertEqual(meta["window_start_utc"], report.iso(start))
+        self.assertEqual(meta["window_end_utc_exclusive"], report.iso(end))
+        self.assertEqual(meta["total"], 2)
+        self.assertEqual(meta["counts"], {"新增": 1, "删除": 0, "修改": 1, "其他操作": 0})
+        self.assertEqual(meta["report_filename"], "2026-10-29-rds操作审计-自定义窗口.html")
+        target = report.write_report(result, self.directory)
+        markup = target.read_text(encoding="utf-8")
+        self.assertIn("<h1>RDS 操作审计报告</h1>", markup)
+        self.assertIn("自定义时间窗口", markup)
+        self.assertIn("2026-10-28 17:32:55 至 2026-10-29 17:32:55", markup)
+        self.assertNotIn("相邻日报", markup)
+        self.assertNotIn("重叠 1 小时", markup)
+        self.assertNotIn("RDS 操作审计日报", markup)
+
+    def test_default_daily_report_retains_title_filename_and_overlap_note(self):
+        result = self.build()
+        markup = report.generate_html(result)
+        self.assertEqual(result["metadata"]["period_kind"], "daily")
+        self.assertEqual(result["metadata"]["report_filename"], "2026-10-29-rds操作审计.html")
+        self.assertIn("<h1>RDS 操作审计日报</h1>", markup)
+        self.assertIn("重叠 1 小时", markup)
+
+    def test_unsupported_period_kind_cannot_silently_select_a_report_window(self):
+        with self.assertRaisesRegex(ValueError, "period_kind"):
+            report.build_daily_report(self.directory, audit_date="2026-10-29", start=START, end=END, period_kind="weekly")
+
     def test_real_offline_archive_is_not_mislabelled_as_fictional_example(self):
         result = report.build_daily_report(self.directory, audit_date="2026-10-29", start=START, end=END, offline=True)
         markup = report.generate_html(result)
