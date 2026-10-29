@@ -20,5 +20,6 @@ rotation.lock
 
 # Generated HTML/normalized data from the invented offline fixture.
 examples/daily-sample/*-rds操作审计.html
+examples/daily-sample/*-rds操作审计-自定义窗口.html
 examples/daily-sample/rds-report.css
 examples/daily-sample/daily-report.json

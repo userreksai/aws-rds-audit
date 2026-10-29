@@ -397,7 +397,7 @@ def build_parser():
     parser.add_argument("--download-instance-logs", action="store_true", help="备用：下载全部当前可见 audit/general 实例日志整文件，会使用实例资源")
     parser.add_argument("--daily", action="store_true", help="生成北京时间昨天07:00至今天08:00的HTML日报，默认下载已有CloudWatch SQL日志")
     parser.add_argument("--date", help="日报窗口结束日期 YYYY-MM-DD，默认北京时间今天")
-    parser.add_argument("--input-dir", type=Path, help="从已有采集目录离线生成日报；不连接AWS")
+    parser.add_argument("--input-dir", type=Path, help="按已有采集目录的原始窗口离线生成HTML；加--daily/--date时生成固定日报，不连接AWS")
     parser.add_argument("--publish-dir", type=Path, help="将日报HTML和CSS复制到此目录，最新报告为index.html")
     parser.add_argument("--send-lark", action="store_true", help="生成HTML后向配置的Lark群发送汇总")
     parser.add_argument("--lark-config", type=Path, default=Path("lark-config.json"), help="Lark私有配置路径")
@@ -514,13 +514,13 @@ def atomic_copy(source: Path, target: Path):
         temporary.unlink(missing_ok=True)
 
 
-def finish_daily(directory, audit_date, start, end, args, status, lark_config=None):
+def finish_daily(directory, audit_date, start, end, args, status, lark_config=None, *, period_kind="daily"):
     from rds_report import build_daily_report, write_report
 
-    report = build_daily_report(directory, audit_date=audit_date, start=start, end=end, offline=bool(args.input_dir))
+    report = build_daily_report(directory, audit_date=audit_date, start=start, end=end, offline=bool(args.input_dir), period_kind=period_kind)
     html_path = write_report(report, directory)
     status = 2 if status == 2 or not report["metadata"]["complete"] else status
-    print(f"HTML日报: {html_path.resolve()}")
+    print(f"{'HTML日报' if period_kind == 'daily' else 'HTML报告'}: {html_path.resolve()}")
     if args.publish_dir:
         try:
             publish = args.publish_dir.resolve()
@@ -543,6 +543,41 @@ def finish_daily(directory, audit_date, start, end, args, status, lark_config=No
     return status
 
 
+def resolve_report_window(args, now):
+    """Keep an archived collection's exact window unless a daily window is requested."""
+    has_custom_window = args.days is not None or args.start or args.end
+    if (args.daily or args.input_dir) and has_custom_window:
+        raise ValueError("--daily/--input-dir 不能与 --days/--start/--end 混用")
+    if args.date and not (args.daily or args.input_dir):
+        raise ValueError("--date 需要 --daily 或 --input-dir")
+    if (args.publish_dir or args.send_lark) and not (args.daily or args.input_dir or has_custom_window):
+        raise ValueError("--publish-dir/--send-lark 需要显式指定 --daily、--input-dir 或自定义时间窗口")
+    beijing = ZoneInfo("Asia/Shanghai")
+    if args.input_dir:
+        source = json.loads((args.input_dir / "report.json").read_text(encoding="utf-8-sig"))
+        source_start = parse_timestamp(source["window"]["start_inclusive"])
+        source_end = parse_timestamp(source["window"]["end_exclusive"])
+        if source_start >= source_end:
+            raise ValueError("输入目录中的采集窗口无效：开始时间必须早于结束时间")
+        day = args.date or source_end.astimezone(beijing).date().isoformat()
+        kind = "daily" if args.daily or args.date else source.get("period_kind", "custom")
+        if kind == "daily":
+            day, start, end = daily_window(day, now)
+            if source_start > start or source_end < end:
+                raise ValueError("输入目录采集窗口未覆盖请求的25小时日报窗口；省略 --daily/--date 可按原始窗口生成自定义HTML")
+            return kind, day, start, end
+        if kind != "custom":
+            raise ValueError("输入目录的 period_kind 必须为 daily 或 custom")
+        return kind, day, source_start, source_end
+    if args.daily:
+        day, start, end = daily_window(args.date, now)
+        if start < now - timedelta(days=90) + timedelta(minutes=1):
+            raise ValueError("该日报已超出CloudTrail近90天范围；请使用已有归档 --input-dir")
+        return "daily", day, start, end
+    start, end = make_window(args, now)
+    return "custom", end.astimezone(beijing).date().isoformat(), start, end
+
+
 def main(argv=None):
     parser = build_parser()
     try:
@@ -554,46 +589,27 @@ def main(argv=None):
             if args.input_dir:
                 raise ValueError("--check-config 不支持 --input-dir")
             return check_configuration(args)
-        daily = args.daily or bool(args.input_dir)
-        if daily and (args.days is not None or args.start or args.end):
-            raise ValueError("日报模式不能与 --days/--start/--end 混用")
-        if not daily and (args.date or args.publish_dir or args.send_lark):
-            raise ValueError("--date/--publish-dir/--send-lark 需要 --daily 或 --input-dir")
         now = datetime.now(UTC)
-        if daily:
-            day = args.date
-            if args.input_dir and not day:
-                source = json.loads((args.input_dir / "report.json").read_text(encoding="utf-8"))
-                day = parse_timestamp(source["window"]["end_exclusive"]).astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
-            audit_date, start, end = daily_window(day, now)
-            config_lark = lark_configuration(args, audit_date)
-            if args.input_dir:
-                directory = args.input_dir.resolve()
-                raw = json.loads((directory / "report.json").read_text(encoding="utf-8"))
-                if parse_timestamp(raw["window"]["start_inclusive"]) > start or parse_timestamp(raw["window"]["end_exclusive"]) < end:
-                    raise ValueError("输入目录采集窗口未覆盖请求的25小时日报窗口，不能生成完整日报")
-                return finish_daily(directory, audit_date, start, end, args, 0, config_lark)
-            if start < now - timedelta(days=90) + timedelta(minutes=1):
-                raise ValueError("该日报已超出CloudTrail近90天范围；请使用已有归档 --input-dir")
+        period_kind, audit_date, start, end = resolve_report_window(args, now)
+        config_lark = lark_configuration(args, audit_date)
+        if args.input_dir:
+            return finish_daily(args.input_dir.resolve(), audit_date, start, end, args, 0, config_lark, period_kind=period_kind)
+        if period_kind == "daily":
             args.download_sql_logs = True
-        else:
-            start, end = make_window(args, now)
-            config_lark = None
         session, config, identity = aws_session(args)
         base = args.output_dir / identity["Account"]
-        if daily:
+        if period_kind == "daily":
             base /= audit_date
         directory = base / (datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8])
         directory.mkdir(parents=True, exist_ok=False)
         beijing = ZoneInfo("Asia/Shanghai")
         print(f"采集窗口（北京时间）: {start.astimezone(beijing):%Y-%m-%d %H:%M:%S} 至 {end.astimezone(beijing):%Y-%m-%d %H:%M:%S}（左闭右开）", flush=True)
         collector = Collector(session, config, start, end, directory, args, identity)
+        collector.report["period_kind"] = period_kind
         status = collector.run()
         print(f"结果: {directory.resolve()}")
         print(f"采集状态: {collector.report['collection_status']}；失败检查数: {collector.report['failed_check_count']}。日志为空不代表没有操作。")
-        if daily:
-            return finish_daily(directory, audit_date, start, end, args, status, config_lark)
-        return status
+        return finish_daily(directory, audit_date, start, end, args, status, config_lark, period_kind=period_kind)
     except ImportError:
         print("缺少 boto3；请使用运行脚本的同一个 Python 执行 -m pip install -r requirements.txt", file=sys.stderr)
     except Exception as exc:

@@ -278,7 +278,9 @@ def _json_lines(path, errors):
         errors.append({"scope": "read_jsonl", "file": path.name, "message": str(exc)})
 
 
-def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end: datetime, offline=False) -> dict:
+def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end: datetime, offline=False, period_kind="daily") -> dict:
+    if period_kind not in {"daily", "custom"}:
+        raise ValueError("period_kind must be daily or custom")
     directory = Path(directory)
     start, end = timestamp(start), timestamp(end)
     if start >= end:
@@ -360,8 +362,11 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
         "无日志不等于无 SQL 操作：审计可能未启用、被用户/事件过滤、延迟、截断或超过保留期。当前配置不能证明历史覆盖完整。",
         "MySQL 无时区的日志原时间不用于猜测时区，报告使用 CloudWatch 事件时间；原时间保留。Aurora Unix 时间戳按 UTC 转换。",
         "SQL 正文可能包含业务数据。已对常见凭据字段和口令语句脱敏，无法保证识别全部业务敏感值；请限制报告访问。",
-        "相邻日报的前一日 07:00 至当日 08:00 窗口有意重叠 1 小时，跨日报数量不可直接相加。",
     ]
+    if period_kind == "daily":
+        notes.append("相邻日报的前一日 07:00 至当日 08:00 窗口有意重叠 1 小时，跨日报数量不可直接相加。")
+    else:
+        notes.append("本报告使用所示的自定义时间窗口，不套用固定日报窗口；所有明细按该窗口左闭右开筛选。")
     if not collection.get("sql_log_download_requested"):
         notes.append("本次未请求下载 CloudWatch SQL 日志，数据库内部增删改未建立采集覆盖。")
     if not audit_envelopes:
@@ -370,11 +375,13 @@ def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end
         "metadata": {
             "audit_date": audit_date, "account_id": str(collection.get("identity", {}).get("Account") or "unknown"),
             "generated_at": iso(datetime.now(UTC)), "window_start_utc": iso(start), "window_end_utc_exclusive": iso(end),
+            "period_kind": period_kind, "period_label": "北京时间日报" if period_kind == "daily" else "自定义时间窗口",
             "timezone": "Asia/Shanghai", "complete": collection.get("collection_status") == "ok" and not errors,
             "report_type": "rds", "source_counts": {key: value["counts"] for key, value in by_source.items()},
             "errors": errors, "offline": bool(offline), "example_data": bool(collection.get("example_data", False)), "counts": counts, "attempted_counts": attempted,
             "total": len(events), "counted_total": sum(counts.values()), "failed_or_partial": sum(row["status"] == "failed" for row in events),
-            "historical_sql_completeness": "not_established", "report_filename": f"{audit_date}-rds操作审计.html",
+            "historical_sql_completeness": "not_established",
+            "report_filename": f"{audit_date}-rds操作审计{'-自定义窗口' if period_kind == 'custom' else ''}.html",
         },
         "events": events, "by_source": by_source,
         "actors": sorted(actor_rows.values(), key=lambda item: (-item["total"], item["actor_key"])),
@@ -393,6 +400,9 @@ def _json(value):
 
 def generate_html(report: dict) -> str:
     meta = report["metadata"]
+    custom = meta.get("period_kind", "daily") == "custom"
+    title = "RDS 操作审计报告" if custom else "RDS 操作审计日报"
+    date_label = "自定义时间窗口 · 窗口结束日期" if custom else "报告日期"
     cards = []
     for category, css_class in (("新增", "create"), ("删除", "delete"), ("修改", "modify")):
         parts = [f"{_e(source['label'])} {int(source['counts'].get(category, 0))}" for source in report["by_source"].values()]
@@ -435,8 +445,8 @@ def generate_html(report: dict) -> str:
     css_version = hashlib.sha256(CSS.encode()).hexdigest()[:12]
     empty = '<p class="empty">当前范围没有取得操作记录，请同时核对采集状态和 SQL 审计覆盖。</p>'
     return f'''<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(meta["audit_date"])} RDS 操作审计日报</title><link rel="stylesheet" href="rds-report.css?v={css_version}"></head>
-<body><main><header><div class="topline"><div><h1>RDS 操作审计日报</h1><div class="muted">报告日期 {_e(meta["audit_date"])} · AWS 账号 {_e(meta["account_id"])}</div></div><div>{badges}</div></div><p class="window">北京时间 {_e(local_time(meta["window_start_utc"]))} 至 {_e(local_time(meta["window_end_utc_exclusive"]))}（左闭右开）<br><small>生成于 {_e(local_time(meta["generated_at"]))}（北京时间）</small></p></header>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(meta["audit_date"])} {_e(title)}</title><link rel="stylesheet" href="rds-report.css?v={css_version}"></head>
+<body><main><header><div class="topline"><div><h1>{_e(title)}</h1><div class="muted">{_e(date_label)} {_e(meta["audit_date"])} · AWS 账号 {_e(meta["account_id"])}</div></div><div>{badges}</div></div><p class="window">北京时间 {_e(local_time(meta["window_start_utc"]))} 至 {_e(local_time(meta["window_end_utc_exclusive"]))}（左闭右开）<br><small>生成于 {_e(local_time(meta["generated_at"]))}（北京时间）</small></p></header>
 <div class="cards">{"".join(cards)}</div><p class="fine">增删改按未报错的请求 / 语句计数；不等于影响行数或最终提交结果。共 {meta["total"]} 条明细，其中失败 {meta["failed_or_partial"]} 条。</p>
 <section><h2>按来源汇总</h2><div class="scroll"><table><thead><tr><th>来源</th><th>新增</th><th>删除</th><th>修改</th><th>其他未报错记录</th><th>失败记录</th><th>全部明细</th></tr></thead><tbody>{"".join(source_rows)}</tbody></table></div><p class="fine">SQL 的连接、表访问等辅助事件只列明细，不加入语句汇总，因此汇总列之和可能小于全部明细。</p></section>
 <section><h2>按操作者汇总</h2><p class="muted">点击操作者查看对应明细；AWS 身份与数据库账号分别展示，角色会话名不等于真实人员姓名。</p><div class="scroll"><table><thead><tr><th>操作者</th><th>来源</th><th>新增</th><th>删除</th><th>修改</th><th>失败</th><th>明细数量</th></tr></thead><tbody>{"".join(actor_summary)}</tbody></table></div>{empty if not actor_summary else ""}</section>
@@ -449,7 +459,7 @@ def write_report(report: dict, directory: Path) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     filename = report["metadata"]["report_filename"]
-    if Path(filename).name != filename or not re.fullmatch(r"\d{4}-\d{2}-\d{2}-rds操作审计\.html", filename):
+    if Path(filename).name != filename or not re.fullmatch(r"\d{4}-\d{2}-\d{2}-rds操作审计(?:-自定义窗口)?\.html", filename):
         raise ValueError("unsafe report filename")
     (directory / "daily-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (directory / "rds-report.css").write_text(CSS, encoding="utf-8")

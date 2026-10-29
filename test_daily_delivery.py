@@ -113,6 +113,61 @@ class RdsLarkTests(unittest.TestCase):
 
 
 class DailyPublicationTests(unittest.TestCase):
+    def test_existing_user_24_hour_collection_generates_html_without_redownload(self):
+        start = datetime(2026, 10, 28, 9, 32, 55, tzinfo=UTC)
+        end = start + timedelta(days=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "20261029T093255Z-20ece9a5"
+            (directory / "cloudwatch").mkdir(parents=True)
+            source = {"identity": {"Account": "123456789012"}, "window": {"start_inclusive": audit.iso(start), "end_exclusive": audit.iso(end)}, "collection_status": "ok", "checks": [], "sql_log_download_requested": True}
+            raw = directory / "report.json"
+            raw.write_text(json.dumps(source), encoding="utf-8")
+            event = {"eventID": "create-one", "eventTime": audit.iso(start), "eventName": "CreateDBSnapshot", "userIdentity": {"type": "IAMUser", "userName": "example"}}
+            (directory / "management-events.jsonl").write_text(json.dumps({"region": "ap-east-1", "event": event}) + "\n", encoding="utf-8")
+            logs = []
+            for event_id, when in (("inside", start + timedelta(seconds=1)), ("end-excluded", end)):
+                logs.append({"region": "ap-east-1", "eventId": event_id, "logGroupName": "/aws/rds/cluster/shenji/audit", "logStreamName": "example", "timestamp": int(when.timestamp() * 1000), "message": f"{int(when.timestamp() * 1000000)},server,example,203.0.113.1,1,1,QUERY,shop,'UPDATE orders SET status=1',0"})
+            sql_path = directory / "cloudwatch/audit.jsonl"
+            sql_path.write_text("".join(json.dumps(row) + "\n" for row in logs), encoding="utf-8")
+            original_raw, original_sql = raw.read_bytes(), sql_path.read_bytes()
+            with patch.object(audit, "aws_session") as connection, patch.object(notify, "send_lark_notification") as send, redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(["--input-dir", str(directory)]), 0)
+            connection.assert_not_called()
+            send.assert_not_called()
+            normalized = json.loads((directory / "daily-report.json").read_text(encoding="utf-8"))
+            self.assertEqual(normalized["metadata"]["period_kind"], "custom")
+            self.assertEqual(normalized["metadata"]["window_start_utc"], audit.iso(start))
+            self.assertEqual(normalized["metadata"]["window_end_utc_exclusive"], audit.iso(end))
+            self.assertEqual(normalized["metadata"]["counts"]["新增"], 1)
+            self.assertEqual(normalized["metadata"]["counts"]["修改"], 1)
+            self.assertEqual(normalized["metadata"]["total"], 2)
+            self.assertTrue((directory / "2026-10-29-rds操作审计-自定义窗口.html").exists())
+            self.assertEqual(raw.read_bytes(), original_raw)
+            self.assertEqual(sql_path.read_bytes(), original_sql)
+            args = audit.build_parser().parse_args(["--input-dir", str(directory), "--date", "2026-10-29"])
+            with self.assertRaisesRegex(ValueError, "未覆盖"):
+                audit.resolve_report_window(args, end + timedelta(seconds=1))
+
+    def test_live_days_collection_automatically_generates_html(self):
+        def collect_without_network(instance):
+            instance.report.update(collection_status="ok", failed_check_count=0)
+            (instance.directory / "report.json").write_text(json.dumps(instance.report), encoding="utf-8")
+            (instance.directory / "management-events.jsonl").write_text("", encoding="utf-8")
+            return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output, session = io.StringIO(), Mock()
+            with patch.object(audit, "aws_session", return_value=(session, None, {"Account": "123456789012", "Arn": "EXAMPLE"})), patch.object(audit.Collector, "run", collect_without_network), redirect_stdout(output):
+                result = audit.main(["--profile", "audit", "--regions", "ap-east-1", "--days", "1", "--download-sql-logs", "--output-dir", temporary])
+            self.assertEqual(result, 0)
+            session.client.assert_not_called()
+            pages = list(Path(temporary).rglob("*-自定义窗口.html"))
+            self.assertEqual(len(pages), 1)
+            self.assertIn("HTML报告", output.getvalue())
+            meta = json.loads((pages[0].parent / "daily-report.json").read_text(encoding="utf-8"))["metadata"]
+            self.assertEqual(meta["period_kind"], "custom")
+            self.assertEqual(audit.parse_timestamp(meta["window_end_utc_exclusive"]) - audit.parse_timestamp(meta["window_start_utc"]), timedelta(days=1))
+
     def test_real_offline_entry_point_generates_full_report_without_aws(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "input"
