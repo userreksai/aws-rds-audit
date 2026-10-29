@@ -12,13 +12,15 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 PAGE_SIZE = 100
 PREVIEW_SIZE = 20
-FORMAT_VERSION = "change-pages-v1"
+FORMAT_VERSION = "change-pages-v2"
 SHORT_LIMIT = 240
 SQL_LIMIT = 4096
 FIELD_LIMIT = 8192
 TRUNCATED = "…【展示已截断，完整字段保存在服务器归档 daily-report.json】"
 EXTRA_CSS = """
 .report-nav,.pagination{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:16px 0}.report-nav a,.pagination a,.button{display:inline-block;background:#eaf1f9;border:1px solid #d4e1ef;padding:8px 12px;border-radius:6px}.pagination span{padding:8px}.record-id{font-size:11px;color:#697b91}.record-preview{max-width:520px}.record-preview pre{margin:4px 0}.state{font-size:12px}.summary-note{max-width:1100px}.operations td{max-width:720px}.operations pre{margin:4px 0}.record-details{max-width:820px}.statline{display:flex;flex-wrap:wrap;gap:20px}.error-item{border-bottom:1px solid #dfe6ee;padding:12px 0}.actor-context{max-width:560px;font-size:11px;overflow-wrap:anywhere}@media(max-width:700px){.operations .operation{min-width:230px}.report-nav a,.pagination a{padding:8px}.statline{gap:10px}}
+.summary-table{table-layout:fixed}.summary-table th,.summary-table td{vertical-align:middle}.summary-table th.number,.summary-table td.number{text-align:right;white-space:nowrap}.source-summary{min-width:620px}.actor-summary{min-width:850px}.actor-details{margin-top:4px;font-size:12px}.actor-details summary{display:inline-block;color:#586b80}.actor-context{margin-top:6px;max-width:100%;white-space:normal;word-break:break-all}.record-preview{min-width:260px}.operation-details>summary{display:inline-block;padding:5px 0;font-weight:500}.operation-content{padding-top:8px}.operation-content h3{font-size:13px;margin:12px 0 6px}.operation-content pre{margin:6px 0 12px}.section-footer{margin:16px 0 0}.index-records{min-width:960px}.index-records td{vertical-align:top}
+.source-summary col.source-label{width:24%}.source-summary col.summary-number{width:15.2%}.actor-summary col.actor-label{width:34%}.actor-summary col.actor-source{width:18%}.actor-summary col.summary-number{width:9.6%}
 """.strip()
 
 
@@ -151,8 +153,34 @@ def _index_table(report, indices, *, prefix=""):
         row = events[index]
         css_class = ' class="failed"' if row.get("status") == "failed" else ""
         statement = _text(row.get("description") or row.get("event_name"))
-        rows.append(f'<tr{css_class} data-event-index="{index}"><td class="nowrap">{_e(row.get("time_local", ""))}</td><td>{_e(_text(row.get("actor"), 120))}<br><small>{_e(row.get("actor_type", ""))}</small></td><td>{_e(row.get("category", ""))}</td><td class="record-preview"><pre>{_e(statement)}</pre><a href="{_href(prefix + _event_link(index))}">查看该条完整展示</a></td><td>{_e(_text(row.get("source_ip"), 120))}<br><small>{_e(_text(row.get("region"), 60))}</small></td><td>{_e(_text(row.get("result")))}</td></tr>')
-    return '<div class="scroll"><table><thead><tr><th>北京时间</th><th>操作者</th><th>分类</th><th>操作信息</th><th>来源 / 区域</th><th>结果</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>' if rows else '<p class="empty">本页没有符合条件的操作记录。</p>'
+        rows.append(f'<tr{css_class} data-event-index="{index}"><td class="nowrap">{_e(row.get("time_local", ""))}</td><td>{_e(_text(row.get("actor"), 120))}<br><small>{_e(row.get("actor_type", ""))}</small></td><td>{_e(row.get("category", ""))}</td><td class="record-preview"><pre>{_e(statement)}</pre>{_operation_details(row)}</td><td>{_e(_text(row.get("source_ip"), 120))}<br><small>{_e(_text(row.get("region"), 60))}</small></td><td>{_e(_text(row.get("result")))}</td></tr>')
+    return '<div class="scroll"><table class="index-records"><thead><tr><th>北京时间</th><th>操作者</th><th>分类</th><th>操作信息</th><th>来源 / 区域</th><th>结果</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>' if rows else '<p class="empty">本页没有符合条件的操作记录。</p>'
+
+
+def _operation_details(row, *, include_statement=True):
+    """This page's evidence expands locally, including when copied by itself."""
+    is_sql = bool(row.get("sql")) or row.get("source_kind") == "sql"
+    label = "展开 SQL 与操作详情" if is_sql and include_statement else "展开操作详情"
+    content = ""
+    if include_statement:
+        title = "SQL 语句" if is_sql else "管理 API"
+        statement = row.get("sql") or row.get("description") or row.get("event_name")
+        content += f'<h3>{title}</h3><pre class="sql-text">{_e(_text(statement, SQL_LIMIT))}</pre>'
+    details = {
+        "记录ID": row.get("event_id"), "执行时间": row.get("time_local"),
+        "操作者": row.get("actor"), "身份": row.get("identity"),
+        "数据库": row.get("database"), "实例": row.get("serverhost"),
+        "来源IP": row.get("source_ip"), "区域": row.get("region"),
+        "执行结果": row.get("result"), "返回码": row.get("return_code"),
+        "时间来源": row.get("timestamp_source", "CloudTrail eventTime"),
+        "原日志时间": row.get("timestamp_raw"), "日志组": row.get("log_group"),
+        "日志流": row.get("log_stream"), "请求参数": row.get("parameters"),
+        "响应": row.get("response"), "错误码": row.get("error_code"),
+        "错误信息": row.get("error_message"), "UserAgent": row.get("user_agent"),
+    }
+    details = {key: value for key, value in details.items() if value is not None and value != ""}
+    content += '<h3>执行信息与参数</h3><pre>' + _json(details) + '</pre>'
+    return f'<details class="operation-details"><summary>{label}</summary><div class="operation-content">{content}</div></details>'
 
 
 def _actor_table(actors, *, prefix=""):
@@ -160,8 +188,9 @@ def _actor_table(actors, *, prefix=""):
     for actor in actors:
         key = str(actor["actor_key"])
         cells = "".join(f'<td class="number">{int(actor.get("counts", {}).get(category, 0))}</td>' for category in ("新增", "删除", "修改"))
-        rows.append(f'<tr><td><a href="{_href(prefix + _actor_prefix(key) + "-000001.html")}">{_e(_text(actor.get("actor"), 120))}</a><br><small>{_e(actor.get("actor_type", ""))}</small><div class="actor-context muted">{_e(_text(key, 180))}</div></td><td>{_e(_model().SOURCE_LABELS.get(actor.get("source_kind"), actor.get("source_kind", "")))}</td>{cells}<td class="number">{int(actor.get("failed", 0))}</td><td class="number">{int(actor.get("total", 0))}</td></tr>')
-    return '<div class="scroll"><table><thead><tr><th>操作者 / 实例上下文</th><th>来源</th><th>新增</th><th>删除</th><th>修改</th><th>失败</th><th>明细数量</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>' if rows else '<p class="empty">当前未取得可展示的增删改操作者。</p>'
+        rows.append(f'<tr><td><a href="{_href(prefix + _actor_prefix(key) + "-000001.html")}">{_e(_text(actor.get("actor"), 120))}</a><br><small>{_e(actor.get("actor_type", ""))}</small><details class="actor-details"><summary>实例与身份</summary><div class="actor-context muted">{_e(_text(key, 600))}</div></details></td><td>{_e(_model().SOURCE_LABELS.get(actor.get("source_kind"), actor.get("source_kind", "")))}</td>{cells}<td class="number">{int(actor.get("failed", 0))}</td><td class="number">{int(actor.get("total", 0))}</td></tr>')
+    columns = '<colgroup><col class="actor-label"><col class="actor-source">' + '<col class="summary-number">' * 5 + '</colgroup>'
+    return '<div class="scroll"><table class="summary-table actor-summary">' + columns + '<thead><tr><th>操作者 / 实例上下文</th><th>来源</th><th class="number">新增</th><th class="number">删除</th><th class="number">修改</th><th class="number">失败</th><th class="number">明细数量</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>' if rows else '<p class="empty">当前未取得可展示的增删改操作者。</p>'
 
 
 def generate_overview(report: dict) -> str:
@@ -176,7 +205,6 @@ def generate_overview(report: dict) -> str:
     for kind, source in report.get("by_source", {}).items():
         cells = "".join(f'<td class="number">{int(source.get("counts", {}).get(category, 0))}</td>' for category in ("新增", "删除", "修改"))
         source_rows.append(f'<tr><td>{_e(source.get("label", kind))}</td>{cells}<td class="number">{int(source.get("failed", 0))}</td><td class="number">{int(source.get("total", 0))}</td></tr>')
-    nav = f'<nav class="report-nav"><a href="{_href(directory + "events-000001.html")}">全部增删改明细</a><a href="{_href(directory + "failed-000001.html")}">失败请求</a><a href="{_href(directory + "actors-000001.html")}">全部操作者</a><a href="{_href(art["bundle_filename"])}" download>下载完整报告包 ZIP</a></nav>'
     actors = report.get("actors", [])
     notes = "".join(f'<li>{_e(_text(note, 1200))}</li>' for note in report.get("coverage", {}).get("notes", [])[:20])
     errors, unparsed = len(meta.get("errors", [])), len(report.get("unparsed", []))
@@ -186,11 +214,13 @@ def generate_overview(report: dict) -> str:
     if coverage:
         missing = len(coverage.get("missing_segments", []))
         body += f'<div class="notice{ " error" if missing else ""}">本地分段覆盖 {int(coverage.get("selected_segments", 0))} / {int(coverage.get("expected_segments", 0))}；缺失 {missing} 段。缺失段不按零操作处理。{"本报告已按补采结果修订。" if coverage.get("revision") else ""}</div>'
-    body += f'<p class="fine">统计全量已识别的增删改记录，共 {int(meta.get("total", 0))} 条明细，其中失败 {int(meta.get("failed_or_partial", 0))} 条。失败请求单列，不计入未报错增删改数量。</p>' + nav
-    body += '<div class="notice summary-note">本页为轻量总览，只预览前 20 条记录；完整明细按每页最多 100 条按需打开，不会自动加载全部日志。单独复制此 HTML 仍有样式；查看明细请保留同目录的分页文件夹，或下载并解压完整报告包。原始 JSON/SQL 归档不会自动加载到浏览器。</div>'
-    body += '<section><h2>按来源汇总</h2><div class="scroll"><table><thead><tr><th>来源</th><th>新增</th><th>删除</th><th>修改</th><th>失败</th><th>明细数量</th></tr></thead><tbody>' + "".join(source_rows) + '</tbody></table></div></section>'
-    body += '<section><h2>按操作者汇总</h2><p class="muted">同名数据库账号按实例/日志流上下文区分，不推定为自然人。总览最多展示前 100 位操作者。</p>' + _actor_table(actors[:PAGE_SIZE], prefix=directory) + '</section>'
-    body += '<section><h2>增删改明细预览</h2>' + _index_table(report, range(min(len(report.get("events", [])), PREVIEW_SIZE)), prefix=directory) + '</section>'
+    columns = '<colgroup><col class="source-label">' + '<col class="summary-number">' * 5 + '</colgroup>'
+    body += '<section><h2>按来源汇总</h2><div class="scroll"><table class="summary-table source-summary">' + columns + '<thead><tr><th>来源</th><th class="number">新增</th><th class="number">删除</th><th class="number">修改</th><th class="number">失败</th><th class="number">明细数量</th></tr></thead><tbody>' + "".join(source_rows) + '</tbody></table></div></section>'
+    more_actors = f'<p class="section-footer"><a href="{_href(directory + "actors-000001.html")}">更多操作者</a></p>' if len(actors) > PAGE_SIZE else ""
+    body += '<section><h2>按操作者汇总</h2>' + _actor_table(actors[:PAGE_SIZE], prefix=directory) + more_actors + '</section>'
+    total = len(report.get("events", []))
+    more_records = f'<p class="section-footer"><a href="{_href(directory + "events-000001.html")}">更多记录（共 {total} 条）</a></p>' if total > PREVIEW_SIZE else ""
+    body += '<section><h2>增删改操作明细</h2>' + _index_table(report, range(min(total, PREVIEW_SIZE)), prefix=directory) + more_records + '</section>'
     body += '<section><h2>采集状态与统计口径</h2>' + issues + '<ul class="coverage-list">' + notes + '</ul></section>'
     title = "RDS 操作审计报告" if meta.get("period_kind") == "custom" else "RDS 操作审计日报"
     return _document(report, title, body)
@@ -200,10 +230,9 @@ def _record_table(report, indices):
     rows = []
     for index in indices:
         row = report["events"][index]
-        details = {"记录ID": row.get("event_id"), "身份": row.get("identity"), "时间来源": row.get("timestamp_source", "CloudTrail eventTime"), "原日志时间": row.get("timestamp_raw"), "日志组": row.get("log_group"), "日志流": row.get("log_stream"), "请求参数": row.get("parameters"), "响应": row.get("response"), "错误码": row.get("error_code"), "错误信息": row.get("error_message"), "UserAgent": row.get("user_agent")}
         resources = '<br>'.join(_e(_text(item, 600)) for item in row.get("resources", [])[:10]) or "—"
         css_class = "failed" if row.get("status") == "failed" else ""
-        rows.append(f'<tr class="record {css_class}" id="event-{index + 1:06d}"><td class="time nowrap">{_e(row.get("time_local", ""))}<br><small class="record-id">#{index + 1}</small></td><td>{_e(_text(row.get("actor"), 120))}<br><small>{_e(row.get("actor_type", ""))}</small><br><span class="chip">{_e(row.get("category", ""))}</span></td><td class="operation"><pre>{_e(_text(row.get("description") or row.get("event_name"), SQL_LIMIT))}</pre><details class="record-details"><summary>身份与操作参数（有长度上限）</summary><pre>{_json(details)}</pre></details></td><td>{resources}</td><td>{_e(_text(row.get("source_ip"), 120))}<br><small>{_e(_text(row.get("region"), 60))}</small></td><td>{_e(_text(row.get("result"), 600))}</td></tr>')
+        rows.append(f'<tr class="record {css_class}" id="event-{index + 1:06d}"><td class="time nowrap">{_e(row.get("time_local", ""))}<br><small class="record-id">#{index + 1}</small></td><td>{_e(_text(row.get("actor"), 120))}<br><small>{_e(row.get("actor_type", ""))}</small><br><span class="chip">{_e(row.get("category", ""))}</span></td><td class="operation"><pre>{_e(_text(row.get("description") or row.get("sql") or row.get("event_name"), SQL_LIMIT))}</pre>{_operation_details(row, include_statement=False)}</td><td>{resources}</td><td>{_e(_text(row.get("source_ip"), 120))}<br><small>{_e(_text(row.get("region"), 60))}</small></td><td>{_e(_text(row.get("result"), 600))}</td></tr>')
     return '<div class="scroll"><table class="operations"><thead><tr><th>北京时间</th><th>操作者 / 分类</th><th>操作信息</th><th>资源 / 数据库</th><th>来源 / 区域</th><th>请求结果</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>' if rows else '<p class="empty">没有符合条件的增删改明细。</p>'
 
 
