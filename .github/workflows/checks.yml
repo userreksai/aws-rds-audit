@@ -22,5 +22,4 @@ jobs:
       - name: Validate systemd calendar and unit syntax
         run: |
           systemd-analyze calendar '*-*-* 08:10:00 Asia/Shanghai'
-          sed -e 's|@RUN_USER@|root|g' -e 's|@RUN_GROUP@|root|g' -e 's|@PROJECT_ROOT@|/tmp|g' -e 's|@HOME_ENV@|HOME=/root|g' -e 's|@PYTHON@|/usr/bin/python3|g' -e 's|@RUNNER@|/tmp/run_daily.py|g' deploy/aws-rds-audit.service > /tmp/aws-rds-audit.service
-          systemd-analyze verify /tmp/aws-rds-audit.service deploy/aws-rds-audit.timer
+          python -m unittest test_unit_render.SystemdIntegrationTests -v

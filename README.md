@@ -52,6 +52,16 @@ sudo bash install.sh --user ubuntu --profile audit --regions all
 
 安装器会检查 Linux/systemd、Python 版本、venv、pip、依赖模块和运行用户，安装可从系统软件源获得的缺少组件，并通过主程序预检 AWS 访问及 Lark 配置。预检不发送消息；真实凭据、授权或配置缺失时会给出错误，保留安装结果，不启动未通过检查的定时任务。修正后重跑安装器即可。
 
+如果旧版安装提示 `WorkingDirectory= path is not absolute` 且路径外带双引号，更新代码后直接重新执行安装命令即可重新生成服务文件，无需删除 `.venv` 或私有配置。例如部署目录为 `/usr/local/aws-rds-shenji` 时：
+
+```bash
+cd /usr/local/aws-rds-shenji
+git pull --ff-only origin main
+bash install.sh --user root --profile audit --regions all --minute 10
+```
+
+服务生成器分别处理 `WorkingDirectory` 路径标量与 `ExecStart` / `Environment` 的引用规则。普通路径及含内部空格、Unicode、百分号的路径受支持；包含 `$`、控制字符、引号、反斜线、通配符起始字符或以空白结尾的项目目录会明确拒绝，避免生成无法启动的服务。
+
 | 安装参数 | 用途 |
 | --- | --- |
 | --user USER | 指定已有的服务运行用户 |

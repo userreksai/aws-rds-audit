@@ -68,7 +68,7 @@ if ((EUID != 0)); then
   exec sudo -- bash "$PROJECT_ROOT/install.sh" "${ORIGINAL_ARGS[@]}"
 fi
 [[ "$PROJECT_ROOT" != *$'\n'* && "$PROJECT_ROOT" != *$'\r'* ]] || fail '项目路径不能包含换行。'
-for name in rds_audit.py rds_report.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer; do
+for name in rds_audit.py rds_report.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer; do
   [[ -f "$PROJECT_ROOT/$name" ]] || fail "项目缺少文件：$name，请先下载完整项目。"
 done
 ENV_FILE=/etc/aws-rds-audit.env
@@ -179,6 +179,7 @@ from pathlib import Path
 root, destination, username, group, profile_set, profile, regions_set, regions, publish_set, publish, minute = sys.argv[1:]
 sys.path.insert(0, str(Path(root) / 'deploy'))
 from run_daily import load_environment
+from render_units import write_units
 env_path = Path(destination)
 existing = load_environment(env_path) if env_path.exists() else {}
 updates = {'AWS_RDS_RUN_USER': username}
@@ -206,22 +207,7 @@ effective = load_environment(env_path)
 run_minute = effective.get('AWS_RDS_MINUTE', '10')
 if run_minute not in {'05', '10'}:
     raise ValueError('AWS_RDS_MINUTE must be 05 or 10')
-def quote(value):
-    if '\n' in value or '\r' in value or '\x00' in value:
-        raise ValueError('Unit paths cannot contain control characters')
-    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
-replacements = {
-    '@RUN_USER@': username, '@RUN_GROUP@': group, '@PROJECT_ROOT@': quote(root),
-    '@HOME_ENV@': quote('HOME=' + account.pw_dir), '@PYTHON@': quote(str(Path(root) / '.venv/bin/python')),
-    '@RUNNER@': quote(str(Path(root) / 'deploy/run_daily.py')),
-}
-service = (Path(root) / 'deploy/aws-rds-audit.service').read_text(encoding='utf-8')
-for key, value in replacements.items(): service = service.replace(key, value)
-timer = (Path(root) / 'deploy/aws-rds-audit.timer').read_text(encoding='utf-8').replace('08:10', '08:' + run_minute)
-Path('/etc/systemd/system/aws-rds-audit.service').write_text(service, encoding='utf-8')
-Path('/etc/systemd/system/aws-rds-audit.timer').write_text(timer, encoding='utf-8')
-for name in ('aws-rds-audit.service', 'aws-rds-audit.timer'):
-    Path('/etc/systemd/system', name).chmod(0o644)
+write_units(Path('/etc/systemd/system'), root, username, group, account.pw_dir, minute=run_minute)
 PY
   systemd-analyze verify /etc/systemd/system/aws-rds-audit.service /etc/systemd/system/aws-rds-audit.timer || fail '生成的 systemd 服务校验失败。'
   systemctl daemon-reload
