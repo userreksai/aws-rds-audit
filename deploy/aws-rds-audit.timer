@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AWS RDS audit daily at 08:10 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 08:10:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=aws-rds-audit.service
+
+[Install]
+WantedBy=timers.target
