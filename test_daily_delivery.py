@@ -167,6 +167,33 @@ class DailyPublicationTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_hong_kong_screenshot_audit_group_is_found_and_probe_is_not_collection(self):
+        ct, rds, logs = Mock(), Mock(), Mock()
+        ct.lookup_events.return_value = {"Events": []}
+        rds.describe_db_instances.return_value = {"DBInstances": [{"DBInstanceIdentifier": "shenji-1", "Engine": "aurora-mysql"}]}
+        rds.describe_db_clusters.return_value = {"DBClusters": [{"DBClusterIdentifier": "shenji", "Engine": "aurora-mysql"}]}
+        rds.describe_events.return_value = {"Events": []}
+        rds.describe_db_log_files.return_value = {"DescribeDBLogFiles": []}
+        audit_group = "/aws/rds/cluster/shenji/audit"
+        logs.describe_log_groups.return_value = {"logGroups": [{"logGroupName": name} for name in (audit_group, "/aws/rds/cluster/shenji/error", "/aws/rds/cluster/test-shenji/error")]}
+        logs.filter_log_events.return_value = {"events": []}
+        session = Mock(client=Mock(side_effect=lambda service, **kwargs: {"cloudtrail": ct, "rds": rds, "logs": logs}[service]))
+        with tempfile.TemporaryDirectory() as temporary:
+            args = audit.build_parser().parse_args(["--check-config", "--regions", "ap-east-1", "--output-dir", temporary])
+            output = io.StringIO()
+            with patch.object(audit, "aws_session", return_value=(session, None, {"Account": "123456789012", "Arn": "EXAMPLE"})), redirect_stdout(output):
+                self.assertEqual(audit.check_configuration(args), 0)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+        request = logs.filter_log_events.call_args.kwargs
+        self.assertEqual(logs.filter_log_events.call_count, 1)
+        self.assertEqual(request["logGroupName"], audit_group)
+        self.assertEqual(request["limit"], 1)
+        self.assertEqual(request["endTime"] - request["startTime"], 1)
+        self.assertIn("ap-east-1: 已发现 /aws/rds/ 日志组 3 个，其中 audit/general 1 个", output.getvalue())
+        self.assertIn(audit_group + " 读取接口验证通过", output.getvalue())
+        self.assertIn("预检不下载日志", output.getvalue())
+        self.assertNotIn("未发现audit/general", output.getvalue())
+
     def test_preflight_does_not_write_report_or_send_notification(self):
         ct, rds, logs = Mock(), Mock(), Mock()
         ct.lookup_events.return_value = {"Events": []}

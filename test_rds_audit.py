@@ -169,6 +169,22 @@ class InstanceLogTests(unittest.TestCase):
 
 
 class CloudWatchTests(unittest.TestCase):
+    def test_hong_kong_download_reports_window_count_without_exposing_sql(self):
+        client = Mock()
+        group = "/aws/rds/cluster/shenji/audit"
+        client.describe_log_groups.return_value = {"logGroups": [{"logGroupName": group}, {"logGroupName": "/aws/rds/cluster/shenji/error"}, {"logGroupName": "RDSOSMetrics"}]}
+        client.filter_log_events.return_value = {"events": [{"eventId": "hk-1", "timestamp": int(START.timestamp() * 1000), "message": "UPDATE private_business_value", "logStreamName": "shenji-1"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            c = collector(directory, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
+            counts, output = summary(), io.StringIO()
+            with redirect_stdout(output):
+                c.cloudwatch("ap-east-1", counts)
+            self.assertEqual(len(counts["sql_log_groups"]), 1)
+            self.assertEqual(counts["sql_log_groups"][0]["download"]["event_count"], 1)
+            self.assertIn("已下载 1 条 CloudWatch 日志事件", output.getvalue())
+            self.assertNotIn("private_business_value", output.getvalue())
+            client.filter_log_events.assert_called_once()
+
     def test_deleted_database_group_and_unfiltered_prepared_multiline_sql(self):
         client = aws_client("logs")
         group = "/aws/rds/cluster/deleted-cluster/audit"
