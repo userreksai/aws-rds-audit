@@ -63,6 +63,48 @@ class Links(HTMLParser):
             self.records += 1
 
 
+class ReportMarkup(HTMLParser):
+    """Inspect related header/cell semantics and native expandable content."""
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self.details = []
+        self._table = self._row = self._cell = None
+        self._open_details = []
+
+    def handle_starttag(self, tag, attributes):
+        attributes = dict(attributes)
+        if tag == "table":
+            self._table = {"classes": attributes.get("class", "").split(), "rows": []}
+            self.tables.append(self._table)
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+            self._table["rows"].append(self._row)
+        elif tag in {"th", "td"} and self._row is not None:
+            self._cell = {"tag": tag, "classes": attributes.get("class", "").split(), "text": ""}
+            self._row.append(self._cell)
+        elif tag == "details":
+            detail = {"classes": attributes.get("class", "").split(), "text": ""}
+            self.details.append(detail)
+            self._open_details.append(detail)
+
+    def handle_endtag(self, tag):
+        if tag == "table":
+            self._table = self._row = self._cell = None
+        elif tag == "tr":
+            self._row = self._cell = None
+        elif tag in {"th", "td"}:
+            self._cell = None
+        elif tag == "details":
+            self._open_details.pop()
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell["text"] += data
+        for detail in self._open_details:
+            detail["text"] += data
+
+
 class LightweightPagesTests(unittest.TestCase):
     def test_overview_size_stays_bounded_and_contains_no_eager_dataset(self):
         small, large = fixture(25), fixture(5000)
@@ -75,7 +117,62 @@ class LightweightPagesTests(unittest.TestCase):
         self.assertNotIn("<script", markup)
         self.assertIn("<style>", markup)
         self.assertIn('href="rds-report.css?v=', markup)
-        self.assertIn("共 5000 条明细", markup)
+        self.assertIn("更多记录（共 5000 条）", markup)
+
+    def test_overview_removes_requested_copy_and_top_navigation(self):
+        markup = pages.generate_overview(fixture(1851))
+        for removed in ("统计全量已识别的增删改记录", "全部增删改明细", "失败请求</a>", "全部操作者</a>", "下载完整报告包 ZIP", "本页为轻量总览", "原始 JSON/SQL 归档不会自动加载到浏览器"):
+            self.assertNotIn(removed, markup)
+        self.assertNotIn('class="report-nav"', markup)
+        self.assertIn("更多记录（共 1851 条）", markup)
+        self.assertIn("按来源汇总", markup)
+        self.assertIn("按操作者汇总", markup)
+
+    def test_current_record_sql_and_identity_expand_without_another_file(self):
+        report = fixture(1)
+        statement = "UPDATE example SET value='" + "v" * 300 + "' WHERE id=71829"
+        report["events"][0].update(description=statement, sql=statement,
+                                   identity={"username": "audit-operator", "connection_id": "connection-71829"},
+                                   parameters={"schema": "business-schema"})
+        markup = pages.generate_overview(report)
+        parsed = ReportMarkup()
+        parsed.feed(markup)
+        operation = [item for item in parsed.details if "operation-details" in item["classes"]]
+        self.assertEqual(len(operation), 1)
+        self.assertIn(statement, operation[0]["text"])
+        self.assertIn("audit-operator", operation[0]["text"])
+        self.assertIn("connection-71829", operation[0]["text"])
+        self.assertIn("business-schema", operation[0]["text"])
+        self.assertNotIn("查看该条完整展示", markup)
+        self.assertNotIn("events-000001.html#event-", markup)
+
+    def test_summary_numeric_headers_align_with_their_cells_and_actor_context_is_collapsible(self):
+        report = fixture(1)
+        actor_key = "sql:/aws/rds/cluster/example/audit:" + "very-long-instance-context-" * 15
+        report["actors"][0]["actor_key"] = actor_key
+        markup = pages.generate_overview(report)
+        parsed = ReportMarkup()
+        parsed.feed(markup)
+        expected = (("source-summary", 1), ("actor-summary", 2))
+        for table_class, first_numeric in expected:
+            table = next(item for item in parsed.tables if table_class in item["classes"])
+            self.assertIn("summary-table", table["classes"])
+            headings = table["rows"][0]
+            self.assertEqual(len(headings) - first_numeric, 5)
+            for column in range(first_numeric, len(headings)):
+                self.assertEqual(headings[column]["tag"], "th")
+                self.assertIn("number", headings[column]["classes"])
+                for row in table["rows"][1:]:
+                    self.assertEqual(len(row), len(headings))
+                    self.assertIn("number", row[column]["classes"])
+        contexts = [item for item in parsed.details if "actor-details" in item["classes"]]
+        self.assertEqual(len(contexts), 1)
+        self.assertIn("sql:/aws/rds/cluster/example/audit:", contexts[0]["text"])
+        self.assertIn("<colgroup>", markup)
+
+    def test_more_actor_navigation_only_appears_when_overview_is_truncated(self):
+        self.assertNotIn("更多操作者", pages.generate_overview(fixture(20, actor_count=20)))
+        self.assertIn("更多操作者", pages.generate_overview(fixture(101, actor_count=101)))
 
     def test_every_event_has_one_canonical_record_and_all_local_links_resolve(self):
         report = fixture(251)
