@@ -236,6 +236,34 @@ def run_incremental(args, *, api=None, now=None):
         if not locks.enter_context(_exclusive(store.directory / ".job.lock")):
             print("已有采集或日报任务运行，本次跳过；后续定时器会继续处理。", flush=True)
             return 0
+        sql_alerts = None
+        sql_budget = [5]
+        sql_delivery = {"sent_messages": 0, "failed_messages": 0, "scan_failed": False}
+        if args.send_lark and getattr(args, "sql_alerts", True):
+            from rds_sql_alerts import SqlChangeAlerts
+            sql_alerts = SqlChangeAlerts(store, now, commands=args.sql_alert_commands)
+
+        def process_sql_alerts(start=None, end=None, path=None):
+            if sql_alerts is None:
+                return
+            try:
+                if path is None:
+                    sql_alerts.scan_committed(now)
+                else:
+                    sql_alerts.scan_snapshot(start, end, path, now)
+                if sql_budget[0]:
+                    delivery = sql_alerts.flush(notify, now, max_messages=sql_budget[0])
+                    for key in ("sent_messages", "failed_messages"):
+                        sql_delivery[key] += delivery[key]
+                        sql_budget[0] -= delivery[key]
+                    if delivery["failed_messages"]:
+                        ops.failure("sql-delivery:" + identity["Account"], {"kind": "sql_alert_delivery_failure", "account_id": identity["Account"], "message": "SQL变更告警投递未确认，已持久化待重试；原始操作记录保留在分段归档。"}, now)
+            except Exception as exc:
+                sql_delivery["scan_failed"] = True
+                ops.failure("sql-processing:" + identity["Account"], {"kind": "sql_alert_processing_failure", "account_id": identity["Account"], "message": "SQL告警扫描/队列处理失败，将由后续采集继续处理：" + _safe_message(exc)}, now)
+                print(f"SQL告警处理未完成（{type(exc).__name__}）；采集检查点与告警队列仍保留。", file=sys.stderr)
+
+        process_sql_alerts()
 
         def collect(start, end, target):
             light = argparse.Namespace(**vars(args))
@@ -243,12 +271,25 @@ def run_incremental(args, *, api=None, now=None):
             collector = api.Collector(session, sdk_config, start, end, target, light, identity)
             collector.report.update(period_kind="custom", incremental=True)
             collector.run()
+            # Valid SQL from a readable region can alert even if another region
+            # failed. Retries share the same durable event identities.
+            process_sql_alerts(start, end, target)
             errors = [item for item in collector.report["checks"] if item["status"] == "error"]
             transport_errors = [item for item in errors if item.get("error_type") != "UnclassifiedSqlRecords"]
             quality = bool(errors) and not transport_errors
             return {"status": 2 if transport_errors else 0, "success": not transport_errors, "quality_partial": quality, "path": str(target), "error": "; ".join(_safe_message(item.get("message", "")) for item in transport_errors)[:1200]}
 
         stats = store.run_due(now, collect, notify, max_buckets=args.max_buckets_per_run, lookback_hours=args.cache_lookback_hours)
+        process_sql_alerts()
+        sql_pending = 0
+        if sql_alerts is not None:
+            sql_state = sql_alerts.stats()
+            sql_pending = sql_state["pending_events"]
+            stats["sql_alerts"] = {**sql_state, **sql_delivery}
+            if not sql_pending and not sql_delivery["failed_messages"]:
+                ops.recovery("sql-delivery:" + identity["Account"], {"account_id": identity["Account"], "message": "SQL变更告警待发队列已投递完成。"}, now)
+            if not sql_delivery["scan_failed"]:
+                ops.recovery("sql-processing:" + identity["Account"], {"account_id": identity["Account"], "message": "SQL告警扫描与队列处理已恢复。"}, now)
         if not stats.get("busy") and not stats.get("failed"):
             ops.recovery("service:aws-rds-audit-collect.service", {"account_id": identity["Account"], "message": "增量采集进程已恢复运行；数据完整性请查看分段状态和日报。"}, now)
         quality = ops.sync_quality(store, now)
@@ -271,7 +312,7 @@ def run_incremental(args, *, api=None, now=None):
             revised._cache_job_locked = True
             run_cached_daily(revised, api=api, now=now)
         pending = ops.flush(notify, now)
-        return 2 if stats.get("failed") or stats.get("pending_alerts") or pending else 0
+        return 2 if stats.get("failed") or stats.get("pending_alerts") or pending or sql_pending or sql_delivery["scan_failed"] else 0
     except Exception as exc:
         ops.failure("identity", {"kind": "collection_start_failure", "message": _safe_message(exc)}, now)
         ops.flush(notify, now, include_quality=False)

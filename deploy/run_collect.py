@@ -14,9 +14,22 @@ except ImportError:
     from run_daily import drop_to_user, load_environment
 
 PROJECT = Path(__file__).resolve().parent.parent
+SQL_ALERT_COMMANDS = ("DELETE", "UPDATE", "DROP", "TRUNCATE", "ALTER")
+
+
+def sql_alert_settings(environment: dict[str, str]) -> tuple[bool, str]:
+    enabled = environment.get("AWS_RDS_SQL_ALERTS", "1")
+    if enabled not in {"0", "1"}:
+        raise ValueError("AWS_RDS_SQL_ALERTS must be 0 or 1")
+    raw = environment.get("AWS_RDS_SQL_ALERT_COMMANDS", ",".join(SQL_ALERT_COMMANDS))
+    commands = list(dict.fromkeys(command.strip().upper() for command in raw.split(",")))
+    if not commands or any(command not in SQL_ALERT_COMMANDS for command in commands):
+        raise ValueError("AWS_RDS_SQL_ALERT_COMMANDS must contain DELETE, UPDATE, DROP, TRUNCATE or ALTER")
+    return enabled == "1", ",".join(commands)
 
 
 def build_command(environment: dict[str, str]) -> list[str]:
+    sql_alerts, sql_commands = sql_alert_settings(environment)
     interval = environment.get("AWS_RDS_INTERVAL_MINUTES") or "30"
     if interval not in {"30", "60"}:
         raise ValueError("AWS_RDS_INTERVAL_MINUTES must be 30 or 60")
@@ -34,6 +47,7 @@ def build_command(environment: dict[str, str]) -> list[str]:
         "--max-buckets-per-run", maximum,
         "--output-dir", environment.get("AWS_RDS_REPORT_ROOT") or str(PROJECT / "reports"),
         "--send-lark", "--lark-config", environment.get("AWS_RDS_LARK_CONFIG") or str(PROJECT / "lark-config.json"),
+        "--sql-alerts" if sql_alerts else "--no-sql-alerts", "--sql-alert-commands", sql_commands,
     ]
     if environment.get("AWS_PROFILE"):
         command.extend(["--profile", environment["AWS_PROFILE"]])

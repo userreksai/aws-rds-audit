@@ -72,13 +72,40 @@ def validate_regions(value: str) -> str:
     return ",".join(dict.fromkeys(regions))
 
 
+def parse_end_timestamp(value: str) -> datetime | str:
+    """Resolve `now` once per run, using the same clock as window validation."""
+    return "now" if value.strip().lower() == "now" else parse_timestamp(value)
+
+
+def parse_sql_alert_commands(value: str) -> tuple[str, ...]:
+    commands = tuple(dict.fromkeys(part.strip().upper() for part in value.split(",")))
+    if not commands or any(command not in {"DELETE", "UPDATE", "DROP", "TRUNCATE", "ALTER"} for command in commands):
+        raise argparse.ArgumentTypeError("SQL告警命令仅支持逗号分隔的 DELETE,UPDATE,DROP,TRUNCATE,ALTER")
+    return commands
+
+
+def validate_query_shortcut(args):
+    if not getattr(args, "since_yesterday_7", False):
+        return
+    if (args.days is not None or args.start or args.end or args.daily or args.date or args.input_dir or
+            args.from_cache or args.collect_incremental or args.check_config or args.notify_service_failure):
+        raise ValueError("--since-yesterday-7 不能与其他时间窗口、日报、离线输入、缓存、增量采集、预检或服务失败告警模式混用")
+
+
 def make_window(args, now: datetime) -> tuple[datetime, datetime]:
-    if bool(args.start) != bool(args.end):
+    validate_query_shortcut(args)
+    shortcut = getattr(args, "since_yesterday_7", False)
+    if not shortcut and bool(args.start) != bool(args.end):
         raise ValueError("--start 和 --end 必须同时提供")
     if args.start and args.days is not None:
         raise ValueError("--days 不能与 --start/--end 同时使用")
-    if args.start:
-        start, end = args.start, args.end
+    if shortcut:
+        beijing = ZoneInfo("Asia/Shanghai")
+        yesterday = now.astimezone(beijing).date() - timedelta(days=1)
+        start = datetime.combine(yesterday, day_time(7), beijing).astimezone(UTC)
+        end = now.astimezone(UTC)
+    elif args.start:
+        start, end = args.start, now if args.end == "now" else args.end
     else:
         days = args.days if args.days is not None else 7
         if not 0 < days < 90:
@@ -436,7 +463,8 @@ def build_parser():
     parser.add_argument("--discovery-region", help="区域发现/STS 使用的区域，默认 SDK 配置区域或 us-east-1")
     parser.add_argument("--days", type=float, help="最近天数，默认 7，小于 90；与 start/end 互斥")
     parser.add_argument("--start", type=parse_timestamp, help="开始时间（含时区），包含该时刻")
-    parser.add_argument("--end", type=parse_timestamp, help="结束时间（含时区），不包含该时刻")
+    parser.add_argument("--end", type=parse_end_timestamp, help="结束时间（含时区或 now），不包含该时刻")
+    parser.add_argument("--since-yesterday-7", action="store_true", help="查询昨日北京时间07:00至当前时间，自动下载已有audit SQL正文")
     parser.add_argument("--output-dir", type=Path, default=Path("reports/rds"), help="输出父目录，每次运行新建子目录")
     parser.add_argument("--download-sql-logs", action="store_true", help="导出已有 CloudWatch audit/general 日志原文")
     parser.add_argument("--download-instance-logs", action="store_true", help="备用：下载全部当前可见 audit/general 实例日志整文件，会使用实例资源")
@@ -445,6 +473,8 @@ def build_parser():
     parser.add_argument("--input-dir", type=Path, help="按已有采集目录的原始窗口离线生成HTML；加--daily/--date时生成固定日报，不连接AWS")
     parser.add_argument("--publish-dir", type=Path, help="将日报HTML和CSS复制到此目录，最新报告为index.html")
     parser.add_argument("--send-lark", action="store_true", help="生成HTML后向配置的Lark群发送汇总")
+    parser.add_argument("--sql-alerts", action=argparse.BooleanOptionalAction, default=True, help="增量采集发现新的删除/修改SQL时发送Lark告警，须同时开启--send-lark；--no-sql-alerts关闭")
+    parser.add_argument("--sql-alert-commands", type=parse_sql_alert_commands, default=("DELETE", "UPDATE", "DROP", "TRUNCATE", "ALTER"), help="SQL即时告警命令，默认 DELETE,UPDATE,DROP,TRUNCATE,ALTER")
     parser.add_argument("--lark-config", type=Path, default=Path("lark-config.json"), help="Lark私有配置路径")
     parser.add_argument("--check-config", action="store_true", help="只检查AWS身份/可见资源读取权限及可选Lark配置，不生成报告、不发消息")
     parser.add_argument("--collect-incremental", action="store_true", help="按半小时/小时分段采集增删改到本地缓存，失败重试并可发Lark告警")
@@ -623,7 +653,8 @@ def finish_daily(directory, audit_date, start, end, args, status, lark_config=No
 
 def resolve_report_window(args, now):
     """Keep an archived collection's exact window unless a daily window is requested."""
-    has_custom_window = args.days is not None or args.start or args.end
+    validate_query_shortcut(args)
+    has_custom_window = args.days is not None or args.start or args.end or args.since_yesterday_7
     if (args.daily or args.input_dir) and has_custom_window:
         raise ValueError("--daily/--input-dir 不能与 --days/--start/--end 混用")
     if args.date and not (args.daily or args.input_dir):
@@ -663,6 +694,7 @@ def main(argv=None):
     except SystemExit as exc:
         return 0 if exc.code == 0 else 1
     try:
+        validate_query_shortcut(args)
         if sum(bool(flag) for flag in (args.collect_incremental, args.from_cache, args.notify_service_failure)) > 1:
             raise ValueError("增量采集、缓存汇总和服务失败告警模式不能同时使用")
         if args.check_config:
@@ -687,7 +719,7 @@ def main(argv=None):
         config_lark = lark_configuration(args, audit_date)
         if args.input_dir:
             return finish_daily(args.input_dir.resolve(), audit_date, start, end, args, 0, config_lark, period_kind=period_kind)
-        if period_kind == "daily":
+        if period_kind == "daily" or args.since_yesterday_7 or args.start:
             args.download_sql_logs = True
         session, config, identity = aws_session(args)
         base = args.output_dir / identity["Account"]
