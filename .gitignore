@@ -1,0 +1,19 @@
+# Generated reports and local Python environment.
+reports/
+preview-site/
+__pycache__/
+*.pyc
+.venv/
+
+# Local AWS credentials must never enter source control.
+.aws/credentials
+credentials
+.env
+.env.*
+lark-config.json
+
+# Password rotation state is private and must stay outside the served directory.
+auth-state/
+access.json
+delivery.json
+rotation.lock

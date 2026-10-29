@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadRdsManagementHistoryAndDiscoverRegions",
+      "Effect": "Allow",
+      "Action": ["cloudtrail:LookupEvents", "ec2:DescribeRegions"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InspectRdsAndExistingLogs",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+        "rds:DescribeEvents",
+        "rds:DescribeDBParameters",
+        "rds:DescribeDBClusterParameters",
+        "rds:DescribeOptionGroups",
+        "rds:DescribeDBLogFiles",
+        "rds:DownloadDBLogFilePortion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DiscoverExistingRdsCloudWatchLogs",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadExistingRdsCloudWatchLogs",
+      "Effect": "Allow",
+      "Action": "logs:FilterLogEvents",
+      "Resource": [
+        "arn:*:logs:*:*:log-group:/aws/rds/instance/*:*",
+        "arn:*:logs:*:*:log-group:/aws/rds/cluster/*:*"
+      ]
+    }
+  ]
+}
