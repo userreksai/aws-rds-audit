@@ -37,6 +37,15 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("write_units(Path('/etc/systemd/system'), root", script)
         self.assertNotIn("'@PROJECT_ROOT@': quote(root)", script)
 
+    def test_installer_keeps_existing_sql_alert_settings_and_validates_before_writing(self):
+        script = (Path(__file__).parent / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("rds_sql_alerts.py", script)
+        self.assertIn("'AWS_RDS_SQL_ALERTS': '1'", script)
+        self.assertIn("'AWS_RDS_SQL_ALERT_COMMANDS': 'DELETE,UPDATE,DROP,TRUNCATE,ALTER'", script)
+        self.assertIn("if key not in existing:", script)
+        self.assertLess(script.index("sql_alert_settings({**existing, **updates})"), script.index("os.replace(temporary, env_path)"))
+        self.assertIn("--no-sql-alerts", script)
+
     def test_collection_units_keep_scalar_directory_and_quoted_execution_paths(self):
         service, timer = render_collection_units("/usr/local/aws-rds-shenji", "root", "root", "/root")
         self.assertIn("WorkingDirectory=/usr/local/aws-rds-shenji\n", service)

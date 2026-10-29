@@ -62,6 +62,8 @@ systemctl list-timers 'aws-rds-audit*' --no-pager
 | `--regions all` 或逗号分隔列表 | 默认所有已启用区域 |
 | `--interval-minutes 30\|60` | 分段长度，默认 30 分钟 |
 | `--minute 05\|10` | 北京时间 08:05 或 08:10，默认 08:10 |
+| `--sql-alerts` / `--no-sql-alerts` | 启用或关闭 SQL 变更即时告警，新安装默认启用 |
+| `--sql-alert-commands DELETE,UPDATE,DROP,TRUNCATE,ALTER` | SQL 告警命令范围，默认全部五种，可选子集 |
 | `--publish-dir /绝对路径` | 可选网页发布目录 |
 | `--no-enable` | 安装并预检，不主动启用定时器 |
 | `--check-only` | 检查现有配置，不安装、不写文件、不启停服务；不与配置修改参数混用 |
@@ -76,6 +78,8 @@ systemctl list-timers 'aws-rds-audit*' --no-pager
 | `AWS_RDS_INTERVAL_MINUTES` | 30 |
 | `AWS_RDS_CACHE_LOOKBACK_HOURS` | 26，新发现分段的回看小时数 |
 | `AWS_RDS_MAX_BUCKETS_PER_RUN` | 6，每轮处理上限 |
+| `AWS_RDS_SQL_ALERTS` | 1；设为 0 关闭 SQL 变更即时告警 |
+| `AWS_RDS_SQL_ALERT_COMMANDS` | DELETE,UPDATE,DROP,TRUNCATE,ALTER；可选子集 |
 | `AWS_RDS_REGIONS` | all |
 | `AWS_RDS_REPORT_ROOT` | 项目下 reports |
 | `AWS_RDS_LARK_CONFIG` | 项目私有 lark-config.json |
@@ -93,6 +97,12 @@ systemctl list-timers 'aws-rds-audit*' --no-pager
 采集失败、日报缺段、解析质量、发布/通知失败记录持久化告警，向 Lark 提醒并在恢复后通知。同一故障每小时最多提醒一次；Webhook 失败留待发送记录并重试。进程异常退出或超时也有 systemd `OnFailure` 告警入口。网络超时可能表示已投递但未确认，重试有可能出现相同事件编号的重复通知。Webhook 不可用时先查看本地日志，恢复后继续投递。
 
 SQL 质量告警按账号和当前成功快照中的未解决分段聚合，其他分段或空段成功不会触发恢复。首次发现问题通知一次，问题集合有变化时最多每小时更新一次；长期未变化的历史问题不反复提醒。只有原问题分段被通过质量检查的成功快照替换、且没有状态无法确认的分段时，才发送恢复通知。升级会从现有快照的小型 report.json 回填质量状态并取消旧逻辑尚未发送的恢复通知，不重新下载整日 SQL；历史隔离证据保留，问题未解决时报告仍标记不完整。
+
+增量采集发现新的 `DELETE`、`UPDATE`、`DROP`、`TRUNCATE`、`ALTER` SQL 时，会向 Lark 发送数据库账号、SQL 摘要、北京时间、实例及执行结果；失败语句也会提示失败结果。SQL 摘要使用有界长度并应用既有凭据脱敏；它可能包含业务值，请确认通知群成员范围。读取查询、INSERT 和 AWS 管理 API 不触发这类 SQL 告警。正常无匹配数据时不发送例行消息，日报与采集异常通知继续按原逻辑运行。
+
+这是分段采集后通知：默认每半小时窗口结束后留 5 分钟发布缓冲，再由采集器发现并告警，并非数据库执行时即时推送。首次启用只从最新可采集分段开始，历史回填不会集中补发；启用后的新数据、迟到数据和重试按原日志事件身份去重。告警分批发送、队列持久化，投递失败会退避重试；网络未确认时可能再次收到同一事件编号的消息。重新运行 `install.sh` 会补齐配置默认值并保留已设置的开关和命令范围。
+
+每轮最多发送 5 批，每批最多 10 条且按消息字节数控制大小；SQL 摘要最多 500 字。超出发送上限的操作保留在待发队列，由后续定时任务继续投递，日志中的 sql_alerts 会显示剩余数量。某区域读取失败时，其他区域已经取得的有效 SQL 仍可告警。
 
 每日 `aws-rds-audit.timer` 只汇总本地成功分段，不发起 25 小时 AWS 全量查询。已发送的当日日报若收到窗口内分段恢复或延迟数据，会自动修订并注明；内容未改变不会自动重复发送。当日 08:00 后的新分段不会无故修订已结束窗口。历史日期不自动逐日重发，可显式补报。
 
@@ -141,7 +151,27 @@ python3 -m venv .venv
   --download-sql-logs --output-dir reports/ap-east-1-check
 ~~~
 
-`--daily` 不加 `--from-cache` 仍直接采集固定日报窗口，适合有意补采，不作为定时默认方式。`--days`、`--start` / `--end` 是自定义窗口；未下载 audit 正文时无法生成 SQL 明细。`--download-instance-logs` 是显式原始取证选项，会下载整文件，可能含 SELECT 等查询，不用于定时增量采集。
+查询**昨日北京时间 07:00 至命令启动时当前时间**：
+
+~~~bash
+.venv/bin/python rds_audit.py --profile audit --regions ap-east-1 \
+  --since-yesterday-7 --output-dir reports/manual
+~~~
+
+指定任意带时区的起止时间，`--end now` 表示命令启动时的当前时间，也可填写明确结束时间：
+
+~~~bash
+.venv/bin/python rds_audit.py --profile audit --regions ap-east-1 \
+  --start '2026-10-28T07:00:00+08:00' --end now --output-dir reports/manual
+
+.venv/bin/python rds_audit.py --profile audit --regions ap-east-1 \
+  --start '2026-10-28T07:00:00+08:00' --end '2026-10-29T21:00:00+08:00' \
+  --output-dir reports/manual
+~~~
+
+快捷和显式起止查询会自动下载 audit SQL 并过滤增删改，直接读取 AWS，不复用半小时缓存，因此能查询到当前未结束的半小时；源日志发布延迟仍可能影响刚发生的操作。查询会生成 HTML；需要同时向 Lark 发送本次汇总时，加 `--send-lark --lark-config lark-config.json`。手工历史查询不触发后台 SQL 即时告警。`--since-yesterday-7` 不与 `--start`、`--end`、`--days`、日报、离线输入或缓存模式混用；显式时间必须带 `+08:00` 或 `Z`，不使用服务器本地时区推断。
+
+`--daily` 不加 `--from-cache` 仍直接采集固定日报窗口，适合有意补采，不作为定时默认方式。`--days`、`--start` / `--end` 是自定义窗口；仅使用 `--days` 时需请求 `--download-sql-logs` 才下载 SQL 正文。`--download-instance-logs` 是显式原始取证选项，会下载整文件，可能含 SELECT 等查询，不用于定时增量采集。
 
 EC2 IAM Role 省略 --profile audit；只生成不推送则省略 --send-lark。Windows Python 路径改为 `.\.venv\Scripts\python.exe`。
 

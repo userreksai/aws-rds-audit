@@ -1,4 +1,4 @@
-"""复用原项目的 Lark Webhook 校验、签名与传输，仅发送 RDS 日报汇总。"""
+"""复用原项目的 Lark Webhook 校验、签名与传输，发送 RDS 汇总及变更告警。"""
 from __future__ import annotations
 
 import base64
@@ -246,10 +246,11 @@ def send_lark_notification(report, config, *, opener=None, now=None, sleep=None,
 
 
 def send_lark_alert(alert, config, *, opener=None, now=None):
-    """Operational alerts contain scope/status only, never SQL or credentials."""
+    """Operational alerts omit SQL; explicit SQL-change alerts contain a bounded excerpt."""
     kind = str(alert.get("type") or alert.get("kind") or "collection_failure")
     recovered = "recover" in kind or "recovery" in kind
-    title = "RDS采集恢复通知" if recovered else "RDS采集告警"
+    sql_change = kind == "sql_change"
+    title = "RDS采集告警｜SQL 删除/修改" if sql_change else "RDS采集恢复通知" if recovered else "RDS采集告警"
     lines = [title, "事件：" + _fragment(kind, 80)]
     for key, label in (("event_id", "事件编号"), ("account_id", "账号"), ("regions", "区域"), ("source_service", "服务"), ("bucket_start", "分段开始"), ("bucket_end", "分段结束"), ("start", "开始"), ("end", "结束"), ("attempts", "累计尝试"), ("missing_count", "缺失分段数"), ("occurred_at", "记录时间")):
         if alert.get(key) is not None:
@@ -257,11 +258,17 @@ def send_lark_alert(alert, config, *, opener=None, now=None):
     message = str(alert.get("message") or alert.get("error") or alert.get("last_error") or "请检查服务器采集状态和日志。")
     # Apply common credential-key redaction to unexpected transport diagnostics.
     message = re.sub(r"(?i)(secret(?:accesskey)?|sessiontoken|password|webhook|authorization)\s*[=:]\s*\S+", r"\1=[REDACTED]", message)
-    lines.append("信息：" + _fragment(message, 900))
+    if sql_change:
+        lines.extend(_fragment(line, 1800) for line in message.splitlines())
+    else:
+        lines.append("信息：" + _fragment(message, 900))
     lines.append("服务器日志：journalctl -u aws-rds-audit-collect.service -n 100 --no-pager")
     payload = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
     webhook = validate_webhook_url(config.get("webhook_url", ""))
-    return _send_payload(_signed_payload(payload, config.get("signing_secret", ""), now), webhook, opener)
+    signed = _signed_payload(payload, config.get("signing_secret", ""), now)
+    if len(_payload_bytes(signed)) > 20 * 1024:
+        raise LarkNotificationError("Lark告警超过20KB，未发送；请缩短SQL摘要或减少单批数量。")
+    return _send_payload(signed, webhook, opener)
 
 
 def main(argv=None):

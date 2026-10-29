@@ -14,6 +14,9 @@ usage() {
   --publish-dir PATH    可选 HTML 网页副本目录；默认不发布网页
   --minute 05|10        北京时间执行分钟；新安装默认 10（08:10）
   --interval-minutes 30|60  增量分段分钟数；默认30，采集器每5分钟检查到期段和失败重试
+  --sql-alerts          启用 SQL 删除/更新等变更即时告警；新安装默认启用
+  --no-sql-alerts       关闭 SQL 变更即时告警，仍保留采集异常及日报通知
+  --sql-alert-commands COMMANDS  逗号分隔 DELETE,UPDATE,DROP,TRUNCATE,ALTER；默认全部五种
   --no-enable           安装并预检，但不启用定时器
   --check-only          只检查已部署环境和配置，不安装软件、不写文件、不启停服务
   --help                显示帮助
@@ -32,6 +35,8 @@ REGIONS=''
 PUBLISH_DIR=''
 MINUTE=''
 INTERVAL=''
+SQL_ALERTS=''
+SQL_COMMANDS=''
 PROFILE_SET=0
 REGIONS_SET=0
 PUBLISH_SET=0
@@ -40,7 +45,7 @@ NO_ENABLE=0
 ORIGINAL_ARGS=("$@")
 while (($#)); do
   case "$1" in
-    --user|--profile|--regions|--publish-dir|--minute|--interval-minutes)
+    --user|--profile|--regions|--publish-dir|--minute|--interval-minutes|--sql-alert-commands)
       (($# >= 2)) || fail "$1 缺少值"
       [[ -n "$2" && "$2" != --* ]] || fail "$1 缺少值"
       case "$1" in
@@ -50,17 +55,20 @@ while (($#)); do
         --publish-dir) PUBLISH_DIR="$2"; PUBLISH_SET=1 ;;
         --minute) MINUTE="$2" ;;
         --interval-minutes) INTERVAL="$2" ;;
+        --sql-alert-commands) SQL_COMMANDS="$2" ;;
       esac
       shift 2 ;;
     --no-enable) NO_ENABLE=1; shift ;;
+    --sql-alerts) SQL_ALERTS=1; shift ;;
+    --no-sql-alerts) SQL_ALERTS=0; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) fail "未知参数：$1" ;;
   esac
 done
 
-if ((CHECK_ONLY && (PROFILE_SET || REGIONS_SET || PUBLISH_SET))) || [[ "$CHECK_ONLY" == 1 && ( -n "$MINUTE" || -n "$INTERVAL" ) ]]; then
-  fail '--check-only 使用现有环境配置，不能同时指定 profile、regions、publish-dir、minute 或 interval-minutes 修改项。'
+if ((CHECK_ONLY && (PROFILE_SET || REGIONS_SET || PUBLISH_SET))) || [[ "$CHECK_ONLY" == 1 && ( -n "$MINUTE" || -n "$INTERVAL" || -n "$SQL_ALERTS" || -n "$SQL_COMMANDS" ) ]]; then
+  fail '--check-only 使用现有环境配置，不能同时指定 profile、regions、publish-dir、minute、interval-minutes 或 SQL 告警修改项。'
 fi
 
 [[ "$(uname -s)" == Linux ]] || fail 'install.sh 只适用于 Linux；Windows 请使用 Python 脚本或 Linux 服务器部署。'
@@ -71,7 +79,7 @@ if ((EUID != 0)); then
   exec sudo -- bash "$PROJECT_ROOT/install.sh" "${ORIGINAL_ARGS[@]}"
 fi
 [[ "$PROJECT_ROOT" != *$'\n'* && "$PROJECT_ROOT" != *$'\r'* ]] || fail '项目路径不能包含换行。'
-for name in rds_audit.py rds_report.py rds_change_filter.py rds_report_pages.py rds_cache.py rds_jobs.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/run_collect.py deploy/run_failure.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer deploy/aws-rds-audit-collect.service deploy/aws-rds-audit-collect.timer deploy/aws-rds-audit-failure@.service; do
+for name in rds_audit.py rds_report.py rds_change_filter.py rds_report_pages.py rds_cache.py rds_jobs.py rds_sql_alerts.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/run_collect.py deploy/run_failure.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer deploy/aws-rds-audit-collect.service deploy/aws-rds-audit-collect.timer deploy/aws-rds-audit-failure@.service; do
   [[ -f "$PROJECT_ROOT/$name" ]] || fail "项目缺少文件：$name，请先下载完整项目。"
 done
 ENV_FILE=/etc/aws-rds-audit.env
@@ -172,7 +180,7 @@ else
   fi
   install -d -m 0750 -o "$RUN_USER" -g "$RUN_GROUP" "$PROJECT_ROOT/reports"
   # Parse existing EnvironmentFile as data, retaining comments/private settings.
-  "$VENV/bin/python" - "$PROJECT_ROOT" "$ENV_FILE" "$RUN_USER" "$RUN_GROUP" "$PROFILE_SET" "$PROFILE" "$REGIONS_SET" "$REGIONS" "$PUBLISH_SET" "$PUBLISH_DIR" "$MINUTE" "$INTERVAL" <<'PY'
+  "$VENV/bin/python" - "$PROJECT_ROOT" "$ENV_FILE" "$RUN_USER" "$RUN_GROUP" "$PROFILE_SET" "$PROFILE" "$REGIONS_SET" "$REGIONS" "$PUBLISH_SET" "$PUBLISH_DIR" "$MINUTE" "$INTERVAL" "$SQL_ALERTS" "$SQL_COMMANDS" <<'PY'
 import json
 import os
 import pwd
@@ -180,10 +188,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-root, destination, username, group, profile_set, profile, regions_set, regions, publish_set, publish, minute, interval = sys.argv[1:]
+root, destination, username, group, profile_set, profile, regions_set, regions, publish_set, publish, minute, interval, sql_alerts, sql_commands = sys.argv[1:]
 sys.path.insert(0, str(Path(root) / 'deploy'))
 from run_daily import load_environment
 from render_units import write_units
+from run_collect import sql_alert_settings
 env_path = Path(destination)
 existing = load_environment(env_path) if env_path.exists() else {}
 updates = {'AWS_RDS_RUN_USER': username}
@@ -192,6 +201,7 @@ defaults = {
     'AWS_RDS_LARK_CONFIG': str(Path(root) / 'lark-config.json'), 'AWS_RDS_MINUTE': '10',
     'AWS_RDS_CACHE_DIR': str(Path(root) / 'cache'), 'AWS_RDS_INTERVAL_MINUTES': '30',
     'AWS_RDS_CACHE_LOOKBACK_HOURS': '26', 'AWS_RDS_MAX_BUCKETS_PER_RUN': '6',
+    'AWS_RDS_SQL_ALERTS': '1', 'AWS_RDS_SQL_ALERT_COMMANDS': 'DELETE,UPDATE,DROP,TRUNCATE,ALTER',
 }
 for key, value in defaults.items():
     if key not in existing:
@@ -201,6 +211,9 @@ if regions_set == '1': updates['AWS_RDS_REGIONS'] = regions
 if publish_set == '1': updates['AWS_RDS_PUBLISH_DIR'] = publish
 if minute: updates['AWS_RDS_MINUTE'] = minute
 if interval: updates['AWS_RDS_INTERVAL_MINUTES'] = interval
+if sql_alerts: updates['AWS_RDS_SQL_ALERTS'] = sql_alerts
+if sql_commands: updates['AWS_RDS_SQL_ALERT_COMMANDS'] = sql_commands
+sql_alert_settings({**existing, **updates})
 content = env_path.read_text(encoding='utf-8-sig') if env_path.exists() else '# RDS audit service environment; single-line KEY="value" settings. Never source this file in a shell.\n'
 lines = [line for line in content.splitlines() if line.partition('=')[0].strip() not in updates]
 lines += [key + '=' + json.dumps(value, ensure_ascii=False) for key, value in updates.items()]
@@ -234,6 +247,15 @@ PY
   systemd-analyze verify /etc/systemd/system/aws-rds-audit.service /etc/systemd/system/aws-rds-audit.timer /etc/systemd/system/aws-rds-audit-collect.service /etc/systemd/system/aws-rds-audit-collect.timer /etc/systemd/system/aws-rds-audit-failure@.service || fail '生成的 systemd 服务校验失败。'
   systemctl daemon-reload
 fi
+
+"$VENV/bin/python" - "$PROJECT_ROOT" "$ENV_FILE" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'deploy'))
+from run_daily import load_environment
+from run_collect import build_command
+build_command(load_environment(Path(sys.argv[2])))
+PY
 
 log '检查系统时间和部署身份；不发送测试消息。'
 date -u '+当前 UTC：%Y-%m-%d %H:%M:%S'
