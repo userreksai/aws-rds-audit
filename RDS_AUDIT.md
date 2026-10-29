@@ -1,5 +1,7 @@
 # RDS MySQL / Aurora MySQL 操作记录采集
 
+HTML 日报、Lark 汇总和 Linux 安装/定时服务的部署说明见 [README.md](README.md)。本文说明原始采集模式、SQL 审计配置与证据边界；下面不带 `--daily` 的命令保留原始时间窗口行为。
+
 `rds_audit.py` 是独立的只读采集脚本，使用 boto3 获取当前 AWS 账号可见的 RDS 管理操作、服务事件、审计配置和已有数据库日志。它不连接数据库，也不修改实例、参数组或日志配置。
 
 ## 能查到哪些记录
