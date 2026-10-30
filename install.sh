@@ -11,7 +11,7 @@ usage() {
   --user USER           服务运行用户；默认 sudo 原调用用户，直接 root 安装则使用 root
   --profile NAME        设置 AWS profile；省略时保留已有配置/使用默认凭据链或实例角色
   --regions REGIONS     all 或逗号分隔区域；新安装默认 all
-  --publish-dir PATH    可选 HTML 网页副本目录；默认不发布网页
+  --publish-dir PATH    完整网页发布目录；默认项目下 index/，首页为 index.html
   --minute 05|10        北京时间执行分钟；新安装默认 10（08:10）
   --interval-minutes 30|60  增量分段分钟数；默认30，采集器每5分钟检查到期段和失败重试
   --sql-alerts          启用 SQL 删除/更新等变更即时告警；新安装默认启用
@@ -184,6 +184,7 @@ else
 import json
 import os
 import pwd
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -202,10 +203,13 @@ defaults = {
     'AWS_RDS_CACHE_DIR': str(Path(root) / 'cache'), 'AWS_RDS_INTERVAL_MINUTES': '30',
     'AWS_RDS_CACHE_LOOKBACK_HOURS': '26', 'AWS_RDS_MAX_BUCKETS_PER_RUN': '6',
     'AWS_RDS_SQL_ALERTS': '1', 'AWS_RDS_SQL_ALERT_COMMANDS': 'DELETE,UPDATE,DROP,TRUNCATE,ALTER',
+    'AWS_RDS_PUBLISH_DIR': str(Path(root) / 'index'),
 }
 for key, value in defaults.items():
     if key not in existing:
         updates[key] = value
+if not existing.get('AWS_RDS_PUBLISH_DIR'):
+    updates['AWS_RDS_PUBLISH_DIR'] = defaults['AWS_RDS_PUBLISH_DIR']
 if profile_set == '1': updates['AWS_PROFILE'] = profile
 if regions_set == '1': updates['AWS_RDS_REGIONS'] = regions
 if publish_set == '1': updates['AWS_RDS_PUBLISH_DIR'] = publish
@@ -242,6 +246,25 @@ if not cache.exists():
     os.chown(cache, account.pw_uid, account.pw_gid)
 elif not cache.is_dir():
     raise ValueError('AWS_RDS_CACHE_DIR is not a directory')
+web = Path(effective['AWS_RDS_PUBLISH_DIR'])
+if not web.is_absolute() or web.is_symlink():
+    raise ValueError('AWS_RDS_PUBLISH_DIR must be an absolute directory, not a symlink')
+resolved_web = web.resolve()
+project = Path(root).resolve()
+report_root = Path(effective.get('AWS_RDS_REPORT_ROOT') or project / 'reports')
+if not report_root.is_absolute():
+    report_root = project / report_root
+private_roots = (cache.resolve(), report_root.resolve())
+if project.is_relative_to(resolved_web) or any(resolved_web.is_relative_to(private) or private.is_relative_to(resolved_web) for private in private_roots):
+    raise ValueError('AWS_RDS_PUBLISH_DIR must be separate from the project root, raw reports and cache')
+if not web.exists():
+    web.mkdir(parents=True, mode=0o755)
+    os.chown(web, account.pw_uid, account.pw_gid)
+elif not web.is_dir():
+    raise ValueError('AWS_RDS_PUBLISH_DIR is not a directory')
+web.chmod(0o755)
+if resolved_web.is_relative_to(project):
+    project.chmod(stat.S_IMODE(project.stat().st_mode) | stat.S_IXOTH)
 write_units(Path('/etc/systemd/system'), root, username, group, account.pw_dir, minute=run_minute)
 PY
   systemd-analyze verify /etc/systemd/system/aws-rds-audit.service /etc/systemd/system/aws-rds-audit.timer /etc/systemd/system/aws-rds-audit-collect.service /etc/systemd/system/aws-rds-audit-collect.timer /etc/systemd/system/aws-rds-audit-failure@.service || fail '生成的 systemd 服务校验失败。'
@@ -281,3 +304,4 @@ else
 fi
 printf '查看日志：journalctl -u aws-rds-audit.service -n 100 --no-pager\n'
 printf '采集与重试日志：journalctl -u aws-rds-audit-collect.service -n 100 --no-pager\n'
+printf '网页首页：配置 AWS_RDS_PUBLISH_DIR 下的 index.html（默认 %s/index/index.html）；Nginx root/alias 指向该发布目录。\n' "$PROJECT_ROOT"

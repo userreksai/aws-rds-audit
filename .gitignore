@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .venv/
 cache/
+index/
 
 # Local AWS credentials must never enter source control.
 .aws/credentials

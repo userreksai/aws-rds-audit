@@ -95,7 +95,7 @@ reports/rds/<AWS账号ID>/<本次运行目录>/
   rds-report.css               HTML 配套样式
 ```
 
-一次性采集命令会自动生成 HTML；增量采集先写分段缓存，日报再统一生成。`--days`、`--start` / `--end` 或默认最近 7 天使用真实查询窗口，HTML 不会套用固定日报的 25 小时范围；定时缓存日报仍生成原有日报文件名。首页仅预览 20 条记录、100 位操作者，不自动载入完整 JSON。页面内置样式并有外部 CSS 回退；查看明细必须保留同目录分页文件夹，或下载并解压完整报告 ZIP。长 SQL 与大字段的完整值保存在服务器 `daily-report.json`。显式自定义窗口也可选用 `--send-lark` 与 `--publish-dir`；不提供这些开关就不会推送或发布。
+一次性采集命令会自动生成 HTML；增量采集先写分段缓存，日报再统一生成。`--days`、`--start` / `--end` 或默认最近 7 天使用真实查询窗口，HTML 不会套用固定日报的 25 小时范围；定时缓存日报仍生成原有日报文件名。首页仅预览 20 条记录、100 位操作者，不自动载入完整 JSON。页面内置样式并有外部 CSS 回退；查看明细必须保留同目录分页文件夹，或下载并解压完整报告 ZIP。长 SQL 与大字段的完整值保存在服务器 `daily-report.json`。报告默认发布到项目 `index/`，使用 `--publish-dir` 可覆盖，`--no-publish` 仅生成归档；只有指定 `--send-lark` 才推送本次汇总。
 
 已有下载目录可以直接生成 HTML，无需重新拉取。例如：
 
@@ -118,7 +118,7 @@ CloudWatch 标准路径为 `/aws/rds/instance/<实例标识>/audit`、`/general`
 
 `report.json` 的下载统计区分 `received_event_count`（候选事件）、`event_count`（保留的事件封装）、`change_record_count`（变更记录）、过滤查询/辅助数与隔离数。同一封装可含多条语句，三个数量不能互换。只保留其中的变更片段时，`original_record_indexes` 保持源记录位置，供去重和核查。源 CloudWatch 日志不被修改。
 
-归档可能含 SQL 业务值，请保存在受控位置。`--publish-dir` 仅发布总览、CSS、分页和 ZIP，不发布完整 JSON/JSONL；ZIP 同样不包含原始证据。
+归档可能含 SQL 业务值，请保存在受控位置。发布目录默认 `/usr/local/aws-rds-shenji/index/`（项目下 index/），首页固定 `index.html`，保留日期 HTML 供明细返回；总览、CSS、完整分页目录和 ZIP 一起复制，不发布完整 JSON/JSONL；ZIP 同样不包含原始证据。站点目录 0755、文件 0644，站点在项目内时仅为项目根补其他用户执行位；原始归档权限保持独立。Nginx root/alias 和其它上级目录可遍历权限由管理员配置。
 
 退出码：
 

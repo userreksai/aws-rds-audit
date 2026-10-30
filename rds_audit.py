@@ -20,6 +20,8 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_PUBLISH_DIR = PROJECT_ROOT / "index"
 MYSQL_ENGINES = {"mysql", "aurora-mysql", "aurora"}
 PARAMETERS = {
     "general_log", "log_output", "binlog_format", "binlog_row_image",
@@ -471,7 +473,9 @@ def build_parser():
     parser.add_argument("--daily", action="store_true", help="生成北京时间昨天07:00至今天08:00的HTML日报，默认下载已有CloudWatch SQL日志")
     parser.add_argument("--date", help="日报窗口结束日期 YYYY-MM-DD，默认北京时间今天")
     parser.add_argument("--input-dir", type=Path, help="按已有采集目录的原始窗口离线生成HTML；加--daily/--date时生成固定日报，不连接AWS")
-    parser.add_argument("--publish-dir", type=Path, help="将日报HTML和CSS复制到此目录，最新报告为index.html")
+    publication = parser.add_mutually_exclusive_group()
+    publication.add_argument("--publish-dir", type=Path, default=DEFAULT_PUBLISH_DIR, help="整套报告网页发布目录，默认项目下index/，首页index.html")
+    publication.add_argument("--no-publish", dest="publish_dir", action="store_const", const=None, help="仅生成归档，不更新网页发布目录")
     parser.add_argument("--send-lark", action="store_true", help="生成HTML后向配置的Lark群发送汇总")
     parser.add_argument("--sql-alerts", action=argparse.BooleanOptionalAction, default=True, help="增量采集发现新的删除/修改SQL时发送Lark告警，须同时开启--send-lark；--no-sql-alerts关闭")
     parser.add_argument("--sql-alert-commands", type=parse_sql_alert_commands, default=("DELETE", "UPDATE", "DROP", "TRUNCATE", "ALTER"), help="SQL即时告警命令，默认 DELETE,UPDATE,DROP,TRUNCATE,ALTER")
@@ -612,6 +616,15 @@ def finish_daily(directory, audit_date, start, end, args, status, lark_config=No
     if args.publish_dir:
         try:
             publish = args.publish_dir.resolve()
+            publish.mkdir(parents=True, exist_ok=True)
+            if os.name == "posix":
+                publish.chmod(0o755)
+                if publish.is_relative_to(PROJECT_ROOT):
+                    # Nginx can traverse the project without granting directory
+                    # listing access or changing private archive/config modes.
+                    mode = PROJECT_ROOT.stat().st_mode & 0o7777
+                    if not mode & 0o001:
+                        PROJECT_ROOT.chmod(mode | 0o001)
             # Publish the complete paginated snapshot before replacing the entry point.
             artifacts = report.get("artifacts") or {}
             manifest = artifacts.get("manifest") or ["rds-report.css", html_path.name]
@@ -659,8 +672,8 @@ def resolve_report_window(args, now):
         raise ValueError("--daily/--input-dir 不能与 --days/--start/--end 混用")
     if args.date and not (args.daily or args.input_dir):
         raise ValueError("--date 需要 --daily 或 --input-dir")
-    if (args.publish_dir or args.send_lark) and not (args.daily or args.input_dir or has_custom_window):
-        raise ValueError("--publish-dir/--send-lark 需要显式指定 --daily、--input-dir 或自定义时间窗口")
+    if args.send_lark and not (args.daily or args.input_dir or has_custom_window):
+        raise ValueError("--send-lark 需要显式指定 --daily、--input-dir 或自定义时间窗口")
     beijing = ZoneInfo("Asia/Shanghai")
     if args.input_dir:
         source = json.loads((args.input_dir / "report.json").read_text(encoding="utf-8-sig"))

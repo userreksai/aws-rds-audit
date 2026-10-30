@@ -46,7 +46,8 @@ chmod 600 lark-config.json
 ~~~bash
 cd /usr/local/aws-rds-shenji
 git pull --ff-only origin main
-bash install.sh --user root --profile audit --regions all --minute 10 --interval-minutes 30
+bash install.sh --user root --profile audit --regions all --minute 10 --interval-minutes 30 \
+  --publish-dir /usr/local/aws-rds-shenji/index
 systemctl start aws-rds-audit-collect.service
 systemctl list-timers 'aws-rds-audit*' --no-pager
 ~~~
@@ -64,7 +65,7 @@ systemctl list-timers 'aws-rds-audit*' --no-pager
 | `--minute 05\|10` | 北京时间 08:05 或 08:10，默认 08:10 |
 | `--sql-alerts` / `--no-sql-alerts` | 启用或关闭 SQL 变更即时告警，新安装默认启用 |
 | `--sql-alert-commands DELETE,UPDATE,DROP,TRUNCATE,ALTER` | SQL 告警命令范围，默认全部五种，可选子集 |
-| `--publish-dir /绝对路径` | 可选网页发布目录 |
+| `--publish-dir /绝对路径` | 网页发布目录，默认项目下 index/；首页 index.html |
 | `--no-enable` | 安装并预检，不主动启用定时器 |
 | `--check-only` | 检查现有配置，不安装、不写文件、不启停服务；不与配置修改参数混用 |
 
@@ -83,7 +84,7 @@ systemctl list-timers 'aws-rds-audit*' --no-pager
 | `AWS_RDS_REGIONS` | all |
 | `AWS_RDS_REPORT_ROOT` | 项目下 reports |
 | `AWS_RDS_LARK_CONFIG` | 项目私有 lark-config.json |
-| `AWS_RDS_PUBLISH_DIR` | 可选发布目录 |
+| `AWS_RDS_PUBLISH_DIR` | 项目下 index；缺少或空值自动使用默认路径，非空自定义值保留 |
 | `AWS_RDS_MINUTE` | 10；变更后重跑安装器同步 timer |
 
 ## 分段、重试与告警
@@ -200,7 +201,20 @@ reports/<账号>/<日报日期>/<运行目录>/
 
 自定义窗口目录没有日报日期层，HTML 文件名多 `-自定义窗口`。页面内置样式并保留外部 CSS 回退，单独复制首页也有样式；**查看明细必须保留分页文件夹，或下载并解压完整报告 ZIP**。ZIP 不包含完整 JSON 和原始日志，原始证据仍保存在服务器。不要直接公开归档目录。
 
-`--publish-dir /var/www/rds-audit` 复制总览、CSS、明细页、ZIP 并更新 index.html，不发布原始 JSON/JSONL。项目不安装网站或修改反向代理。Lark 只发数量、状态、范围与已配置链接，不发送 SQL 正文。
+默认将整套网页复制到项目下 `index/`。按本项目服务器路径部署时，首页为 **`/usr/local/aws-rds-shenji/index/index.html`**，目录内容如下：
+
+~~~text
+/usr/local/aws-rds-shenji/index/
+  index.html                          最新报告首页
+  YYYY-MM-DD-rds操作审计.html          带日期首页，供明细页返回
+  YYYY-MM-DD-rds操作审计-pages-<hash>/  完整分页目录
+  YYYY-MM-DD-rds操作审计-完整报告.zip
+  rds-report.css
+~~~
+
+发布按清单先复制分页、CSS、ZIP，再原子更新日期首页与 `index.html`，因此无需手工 cp 首页；文件权限为 0644，发布根目录和分页目录为 0755。原始 JSON/JSONL、分段缓存及私有配置继续保存在服务器归档中，不复制到站点。可用 `--publish-dir` 改发布路径，手工运行仅需归档时使用 `--no-publish`。
+
+Nginx 由管理员配置，`root` 或 `alias` 指向 `/usr/local/aws-rds-shenji/index/`，首页使用 `index.html`。站点在项目内时，项目根目录仅补其他用户执行位，以允许沿已知路径访问 index/；不递归放宽 reports、cache 或私有配置权限。其它系统上级目录仍须允许 Nginx 用户遍历。项目不安装网站或修改反向代理。日报 Lark 发数量、状态与报告链接，SQL 即时告警按配置发送有界摘要。
 
 已有 40,510 条 CloudWatch 事件的香港目录可离线重建为排除查询的分页报告：
 

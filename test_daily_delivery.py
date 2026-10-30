@@ -131,7 +131,7 @@ class DailyPublicationTests(unittest.TestCase):
             sql_path.write_text("".join(json.dumps(row) + "\n" for row in logs), encoding="utf-8")
             original_raw, original_sql = raw.read_bytes(), sql_path.read_bytes()
             with patch.object(audit, "aws_session") as connection, patch.object(notify, "send_lark_notification") as send, redirect_stdout(io.StringIO()):
-                self.assertEqual(audit.main(["--input-dir", str(directory)]), 0)
+                self.assertEqual(audit.main(["--input-dir", str(directory), "--no-publish"]), 0)
             connection.assert_not_called()
             send.assert_not_called()
             normalized = json.loads((directory / "daily-report.json").read_text(encoding="utf-8"))
@@ -158,7 +158,7 @@ class DailyPublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output, session = io.StringIO(), Mock()
             with patch.object(audit, "aws_session", return_value=(session, None, {"Account": "123456789012", "Arn": "EXAMPLE"})), patch.object(audit.Collector, "run", collect_without_network), redirect_stdout(output):
-                result = audit.main(["--profile", "audit", "--regions", "ap-east-1", "--days", "1", "--download-sql-logs", "--output-dir", temporary])
+                result = audit.main(["--profile", "audit", "--regions", "ap-east-1", "--days", "1", "--download-sql-logs", "--output-dir", temporary, "--no-publish"])
             self.assertEqual(result, 0)
             session.client.assert_not_called()
             pages = list(Path(temporary).rglob("*-自定义窗口.html"))
@@ -173,7 +173,7 @@ class DailyPublicationTests(unittest.TestCase):
             directory = Path(temporary) / "input"
             shutil.copytree(Path(__file__).parent / "examples/daily-sample", directory)
             with patch.object(audit, "aws_session") as connection, patch.object(notify, "send_lark_notification") as send, redirect_stdout(io.StringIO()):
-                status = audit.main(["--input-dir", str(directory), "--date", "2026-10-29"])
+                status = audit.main(["--input-dir", str(directory), "--date", "2026-10-29", "--no-publish"])
             self.assertEqual(status, 2)  # The sample CALL is quarantined, not guessed as read-only.
             connection.assert_not_called()
             send.assert_not_called()
@@ -217,7 +217,7 @@ class DailyPublicationTests(unittest.TestCase):
     def test_lark_failure_keeps_partial_status_priority(self):
         import rds_report
         report = example_report()
-        args = audit.build_parser().parse_args(["--daily", "--send-lark"])
+        args = audit.build_parser().parse_args(["--daily", "--send-lark", "--no-publish"])
         with tempfile.TemporaryDirectory() as temporary, patch.object(rds_report, "build_daily_report", return_value=report), patch.object(rds_report, "write_report", return_value=Path(temporary) / "kept.html"), patch.object(notify, "send_lark_notification", side_effect=notify.LarkNotificationError("failed")), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(audit.finish_daily(Path(temporary), "2026-10-29", datetime.now(UTC), datetime.now(UTC), args, 2, {"webhook_url": WEBHOOK}), 2)
 
