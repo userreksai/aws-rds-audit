@@ -19,7 +19,7 @@ ACCOUNT = "123456789012"
 
 
 def args(root, *extra):
-    return audit.build_parser().parse_args(["--profile", "audit", "--regions", "ap-east-1", "--cache-dir", str(root / "cache"), "--output-dir", str(root / "reports"), *extra])
+    return audit.build_parser().parse_args(["--profile", "audit", "--regions", "ap-east-1", "--cache-dir", str(root / "cache"), "--output-dir", str(root / "reports"), "--no-publish", *extra])
 
 
 def make_snapshot(start, end, target, marker="one"):

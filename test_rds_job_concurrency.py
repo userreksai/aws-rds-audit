@@ -21,7 +21,7 @@ ACCOUNT = "123456789012"
 def options(root, *extra):
     return audit.build_parser().parse_args([
         "--profile", "audit", "--regions", "ap-east-1", "--cache-dir", str(root / "cache"),
-        "--output-dir", str(root / "reports"), "--max-buckets-per-run", "100", *extra,
+        "--output-dir", str(root / "reports"), "--max-buckets-per-run", "100", "--no-publish", *extra,
     ])
 
 

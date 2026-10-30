@@ -72,8 +72,14 @@ class EnvironmentTests(unittest.TestCase):
         command = runner.build_command({}, check=True)
         self.assertIn("--check-config", command)
         self.assertIn("--send-lark", command)
-        for unwanted in ("--daily", "--from-cache", "--collect-incremental", "--date", "--profile", "--publish-dir"):
+        for unwanted in ("--daily", "--from-cache", "--collect-incremental", "--date", "--profile"):
             self.assertNotIn(unwanted, command)
+        self.assertEqual(command[command.index("--publish-dir") + 1], str(runner.PROJECT / "index"))
+
+    def test_default_and_empty_publish_settings_use_project_index(self):
+        for values in ({}, {"AWS_RDS_PUBLISH_DIR": ""}):
+            command = runner.build_command(values, now=datetime(2026, 10, 29, 0, tzinfo=timezone.utc))
+            self.assertEqual(command[command.index("--publish-dir") + 1], str(runner.PROJECT / "index"))
 
     def test_precheck_does_not_create_reports_or_run_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -84,9 +90,14 @@ class EnvironmentTests(unittest.TestCase):
                 self.assertEqual(runner.main(["--check-config"]), 0)
             execute.assert_called_once()
             self.assertFalse(reports.exists())
+            self.assertFalse((project / "index").exists())
 
 
 class IncrementalCommandTests(unittest.TestCase):
+    def test_default_and_empty_publish_settings_match_daily_index_directory(self):
+        for values in ({}, {"AWS_RDS_PUBLISH_DIR": ""}):
+            command = collect_runner.build_command(values)
+            self.assertEqual(command[command.index("--publish-dir") + 1], str(collect_runner.PROJECT / "index"))
     def test_sql_alerts_are_enabled_with_all_five_requested_commands_by_default(self):
         command = collect_runner.build_command({})
         self.assertIn("--sql-alerts", command)

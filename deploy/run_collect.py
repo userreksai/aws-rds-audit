@@ -51,8 +51,7 @@ def build_command(environment: dict[str, str]) -> list[str]:
     ]
     if environment.get("AWS_PROFILE"):
         command.extend(["--profile", environment["AWS_PROFILE"]])
-    if environment.get("AWS_RDS_PUBLISH_DIR"):
-        command.extend(["--publish-dir", environment["AWS_RDS_PUBLISH_DIR"]])
+    command.extend(["--publish-dir", environment.get("AWS_RDS_PUBLISH_DIR") or str(PROJECT / "index")])
     return command
 
 
