@@ -106,151 +106,108 @@ class ReportMarkup(HTMLParser):
 
 
 class LightweightPagesTests(unittest.TestCase):
-    def test_overview_size_stays_bounded_and_contains_no_eager_dataset(self):
+    def test_overview_size_depends_on_users_not_statement_volume(self):
         small, large = fixture(25), fixture(5000)
         markup = pages.generate_overview(large)
-        self.assertLess(len(markup.encode()), 100000)
+        self.assertLess(len(markup.encode()), 30000)
         self.assertLess(abs(len(markup) - len(pages.generate_overview(small))), 2000)
-        self.assertEqual(markup.count("data-event-index="), pages.PREVIEW_SIZE)
-        self.assertNotIn("EVT-004999", markup)
-        self.assertNotIn("daily-report.json\"", markup)
-        self.assertNotIn("<script", markup)
-        self.assertIn("<style>", markup)
-        self.assertIn('href="rds-report.css?v=', markup)
-        self.assertIn("更多记录（共 5000 条）", markup)
-
-    def test_overview_removes_requested_copy_and_top_navigation(self):
-        markup = pages.generate_overview(fixture(1851))
-        for removed in ("统计全量已识别的增删改记录", "全部增删改明细", "失败请求</a>", "全部操作者</a>", "下载完整报告包 ZIP", "本页为轻量总览", "原始 JSON/SQL 归档不会自动加载到浏览器"):
-            self.assertNotIn(removed, markup)
-        self.assertNotIn('class="report-nav"', markup)
-        self.assertIn("更多记录（共 1851 条）", markup)
+        for forbidden in ("data-event-index=", "EVT-004999", "UPDATE example", "operation-details", "更多记录", "增删改操作明细", "<script"):
+            self.assertNotIn(forbidden, markup)
         self.assertIn("按来源汇总", markup)
         self.assertIn("按操作者汇总", markup)
+        self.assertIn("<style>", markup)
 
-    def test_current_record_sql_and_identity_expand_without_another_file(self):
+    def test_only_user_totals_are_exported_even_for_legacy_models(self):
         report = fixture(1)
-        statement = "UPDATE example SET value='" + "v" * 300 + "' WHERE id=71829"
-        report["events"][0].update(description=statement, sql=statement,
-                                   identity={"username": "audit-operator", "connection_id": "connection-71829"},
-                                   parameters={"schema": "business-schema"})
-        markup = pages.generate_overview(report)
-        parsed = ReportMarkup()
-        parsed.feed(markup)
-        operation = [item for item in parsed.details if "operation-details" in item["classes"]]
-        self.assertEqual(len(operation), 1)
-        self.assertIn(statement, operation[0]["text"])
-        self.assertIn("audit-operator", operation[0]["text"])
-        self.assertIn("connection-71829", operation[0]["text"])
-        self.assertIn("business-schema", operation[0]["text"])
-        self.assertNotIn("查看该条完整展示", markup)
-        self.assertNotIn("events-000001.html#event-", markup)
+        report["events"][0].update(sql="SECRET_SQL_TEXT", parameters={"password": "NEVER_EXPORT"})
+        report["actors"][0]["contexts"] = [{"database": "PRIVATE_DATABASE"}]
+        report["metadata"]["errors"] = [{"message": "PRIVATE_ERROR_SQL"}]
+        report["unparsed"] = [{"raw": "UNKNOWN_RAW_SQL"}]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            main = pages.write_paginated_report(report, directory)
+            stored = json.loads((directory / "daily-report.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["events"], [])
+            self.assertEqual(stored["unparsed"], [])
+            self.assertNotIn("contexts", stored["actors"][0])
+            for path in directory.glob("*"):
+                if path.suffix in {".json", ".html"}:
+                    text = path.read_text(encoding="utf-8")
+                    for value in ("SECRET_SQL_TEXT", "NEVER_EXPORT", "PRIVATE_DATABASE", "PRIVATE_ERROR_SQL", "UNKNOWN_RAW_SQL"):
+                        self.assertNotIn(value, text)
+            self.assertEqual(report["artifacts"]["detail_pages"], 0)
+            self.assertEqual(len(list(directory.glob("*.html"))), 1)
+            with ZipFile(directory / report["artifacts"]["bundle_filename"]) as archive:
+                self.assertIsNone(archive.testzip())
+                self.assertEqual(set(archive.namelist()), {main.name, "rds-report.css"})
 
-    def test_summary_numeric_headers_align_with_their_cells_and_actor_context_is_collapsible(self):
-        report = fixture(1)
-        actor_key = "sql:/aws/rds/cluster/example/audit:" + "very-long-instance-context-" * 15
-        report["actors"][0]["actor_key"] = actor_key
-        markup = pages.generate_overview(report)
+    def test_summary_numeric_headers_align_with_their_cells(self):
         parsed = ReportMarkup()
-        parsed.feed(markup)
-        expected = (("source-summary", 1), ("actor-summary", 2))
-        for table_class, first_numeric in expected:
+        parsed.feed(pages.generate_overview(fixture(3)))
+        for table_class, first_numeric in (("source-summary", 1), ("actor-summary", 2)):
             table = next(item for item in parsed.tables if table_class in item["classes"])
-            self.assertIn("summary-table", table["classes"])
             headings = table["rows"][0]
-            self.assertEqual(len(headings) - first_numeric, 5)
-            for column in range(first_numeric, len(headings)):
-                self.assertEqual(headings[column]["tag"], "th")
-                self.assertIn("number", headings[column]["classes"])
-                for row in table["rows"][1:]:
-                    self.assertEqual(len(row), len(headings))
-                    self.assertIn("number", row[column]["classes"])
-        contexts = [item for item in parsed.details if "actor-details" in item["classes"]]
-        self.assertEqual(len(contexts), 1)
-        self.assertIn("sql:/aws/rds/cluster/example/audit:", contexts[0]["text"])
-        self.assertIn("<colgroup>", markup)
+            for row in table["rows"]:
+                self.assertEqual(len(row), len(headings))
+                for cell in row[first_numeric:]:
+                    self.assertIn("number", cell["classes"])
+        self.assertEqual(parsed.details, [])
 
     def test_more_actor_navigation_only_appears_when_overview_is_truncated(self):
         self.assertNotIn("更多操作者", pages.generate_overview(fixture(20, actor_count=20)))
         self.assertIn("更多操作者", pages.generate_overview(fixture(101, actor_count=101)))
 
-    def test_every_event_has_one_canonical_record_and_all_local_links_resolve(self):
-        report = fixture(251)
-        expected_counts = deepcopy(report["metadata"]["counts"])
+    def test_user_pages_are_bounded_and_all_local_links_resolve(self):
+        report = fixture(251, actor_count=251)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             main = pages.write_paginated_report(report, directory)
-            artifacts = report["artifacts"]
-            self.assertEqual(artifacts["detail_pages"], 3)
-            detail = directory / artifacts["detail_directory"]
-            ids = []
-            for path in sorted(detail.glob("events-*.html")):
+            detail = directory / report["artifacts"]["detail_directory"]
+            children = sorted(detail.glob("*.html"))
+            self.assertEqual(len(children), 3)
+            for path in [main, *children]:
+                markup = path.read_text(encoding="utf-8")
                 parsed = Links()
-                parsed.feed(path.read_text(encoding="utf-8"))
-                self.assertLessEqual(parsed.records, pages.PAGE_SIZE)
-                ids += [value for value in parsed.ids if value.startswith("event-")]
-            self.assertEqual(ids, [f"event-{index + 1:06d}" for index in range(251)])
-            for path in [main, *detail.glob("*.html")]:
-                parsed = Links()
-                parsed.feed(path.read_text(encoding="utf-8"))
+                parsed.feed(markup)
+                self.assertEqual(parsed.records, 0)
+                for forbidden in ("UPDATE example", "EVT-", "operation-details", "events-", "failed-", "unparsed-"):
+                    self.assertNotIn(forbidden, markup)
+                tables = ReportMarkup()
+                tables.feed(markup)
+                users = next(table for table in tables.tables if "actor-summary" in table["classes"])
+                self.assertLessEqual(len(users["rows"])-1, pages.PAGE_SIZE)
                 for link in parsed.hrefs:
                     parts = urlsplit(link)
                     self.assertFalse(parts.scheme)
                     target = (path.parent / unquote(parts.path)).resolve()
                     self.assertTrue(target.is_relative_to(directory.resolve()))
-                    self.assertTrue(target.exists(), (path.name, link))
-                    if parts.fragment:
-                        target_html = target.read_text(encoding="utf-8")
-                        self.assertIn(f'id="{parts.fragment}"', target_html)
-            self.assertEqual(report["metadata"]["counts"], expected_counts)
-            normalized = json.loads((directory / "daily-report.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(normalized["events"]), 251)
-            with ZipFile(directory / artifacts["bundle_filename"]) as archive:
-                self.assertIsNone(archive.testzip())
-                self.assertIn(main.name, archive.namelist())
-                self.assertNotIn("daily-report.json", archive.namelist())
-                self.assertFalse(any(name.endswith(".jsonl") for name in archive.namelist()))
+                    self.assertTrue(target.is_file(), (path.name, link))
 
-    def test_xss_is_escaped_and_very_large_fields_do_not_expand_pages_without_limit(self):
+    def test_actor_xss_is_escaped_and_operation_fields_are_absent(self):
         report = fixture(1)
-        row = report["events"][0]
-        row["description"] = "UPDATE t SET value='<script>attack()</script>' " + "x" * 200000
-        row["source_ip"] = "<img src=x onerror=attack()>"
-        row["parameters"] = {"password": "DO-NOT-SHOW", "large": "p" * 200000}
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            main = pages.write_paginated_report(report, directory)
-            child = directory / report["artifacts"]["detail_directory"] / "events-000001.html"
-            for path in (main, child):
-                markup = path.read_text(encoding="utf-8")
-                self.assertNotIn("<script>", markup)
-                self.assertNotIn("<img ", markup)
-                self.assertNotIn("DO-NOT-SHOW", markup)
-                self.assertIn("&lt;script&gt;", markup)
-                self.assertIn("展示已截断", markup)
-                self.assertLess(path.stat().st_size, 100000)
-            self.assertIn("x" * 50000, (directory / "daily-report.json").read_text(encoding="utf-8"))
+        report["actors"][0]["actor"] = "<script>attack()</script>"
+        report["events"][0].update(description="q" * 200000, source_ip="<img src=x onerror=attack()>")
+        markup = pages.generate_overview(report)
+        self.assertIn("&lt;script&gt;", markup)
+        self.assertNotIn("<script>", markup)
+        self.assertNotIn("<img ", markup)
+        self.assertNotIn("q" * 1000, markup)
+        self.assertLess(len(markup.encode()), 30000)
 
-    def test_large_issue_lists_are_paginated_and_absent_from_overview(self):
+    def test_incomplete_summary_shows_quality_counter_without_raw_evidence(self):
         report = fixture(0)
         report["metadata"]["complete"] = False
-        report["metadata"]["errors"] = [{"message": f"ISSUE-{index:04d}"} for index in range(201)]
-        report["unparsed"] = [{"raw": f"UNKNOWN-RAW-{index:04d}"} for index in range(201)]
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            main = pages.write_paginated_report(report, directory)
-            overview = main.read_text(encoding="utf-8")
-            self.assertNotIn("UNKNOWN-RAW-0200", overview)
-            self.assertNotIn("ISSUE-0200", overview)
-            detail = directory / report["artifacts"]["detail_directory"]
-            for prefix, marker in (("errors", "ISSUE-0200"), ("unparsed", "UNKNOWN-RAW-0200")):
-                files = sorted(detail.glob(prefix + "-*.html"))
-                self.assertEqual(len(files), 3)
-                self.assertTrue(all(path.read_text(encoding="utf-8").count('class="error-item"') <= 100 for path in files))
-                self.assertIn(marker, files[-1].read_text(encoding="utf-8"))
+        report["coverage"]["unparsed_records"] = 100000000
+        report["metadata"]["errors"] = [{"message": "PRIVATE_SQL"}]
+        report["unparsed"] = [{"raw": "RAW_SQL"}]
+        markup = pages.generate_overview(report)
+        self.assertIn("当前汇总不完整", markup)
+        self.assertIn("100000000", markup)
+        self.assertNotIn("PRIVATE_SQL", markup)
+        self.assertNotIn("RAW_SQL", markup)
 
-    def test_same_data_reuses_asset_directory_despite_new_generated_timestamp(self):
-        report = fixture(2)
+    def test_same_summary_reuses_asset_directory_despite_new_timestamp(self):
+        report = fixture(101, actor_count=101)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             pages.write_paginated_report(report, directory)

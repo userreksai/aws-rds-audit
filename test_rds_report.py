@@ -67,20 +67,20 @@ class ReportFixture(unittest.TestCase):
         self.assertEqual(meta["counted_total"], 3)
         self.assertEqual(meta["attempted_counts"]["删除"], 2)
         self.assertEqual(sum(item["total"] for item in result["actors"]), 5)
-        self.assertTrue(all("COMMIT" not in row["result"] for row in result["events"]))
-        sql_row = next(row for row in result["events"] if row["source_kind"] == "sql" and row["event_id"] == "s1:0")
-        self.assertIn("不证明事务提交", sql_row["result"])
+        self.assertEqual(result["events"], [])
+        self.assertTrue(result["metadata"]["summary_only"])
+        self.assertIn("不证明事务最终提交", " ".join(result["coverage"]["notes"]))
 
     def test_management_event_id_deduplicates_and_excludes_read_calls(self):
         event = management("same", "DescribeDBInstances", readOnly=True)
         change = management("change", "CreateDBInstance")
         self.save([event, change, {**change, "region": "us-east-1"}], [])
         result = self.build()
-        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["metadata"]["total"], 1)
         self.assertEqual(result["metadata"]["counts"]["其他操作"], 0)
         self.assertEqual(result["metadata"]["counts"]["新增"], 1)
         self.assertEqual(result["coverage"]["filtered_management"], 1)
-        self.assertEqual(result["events"][0]["actor"], "ops/session-123")
+        self.assertEqual(result["actors"][0]["actor"], "ops/session-123")
 
     def test_sql_event_id_dedup_does_not_merge_different_streams(self):
         event = audit_event()
@@ -90,7 +90,7 @@ class ReportFixture(unittest.TestCase):
         self.assertEqual(result["coverage"]["duplicate_cloudwatch_events"], 1)
         self.assertEqual(len(result["actors"]), 1)
         self.assertEqual(result["actors"][0]["total"], 2)
-        self.assertEqual(len(result["actors"][0]["contexts"]), 2)
+        self.assertNotIn("contexts", result["actors"][0])
 
     def test_database_username_merges_instances_but_preserves_details_and_identity_sources(self):
         writes = [audit_event("INSERT INTO t VALUES (1)", event_id="insert", stream="writer-a"),
@@ -105,24 +105,16 @@ class ReportFixture(unittest.TestCase):
         self.assertEqual(combined["total"], 3)
         self.assertEqual(combined["failed"], 1)
         self.assertEqual(combined["counts"], {"新增": 1, "删除": 0, "修改": 1, "其他操作": 0})
-        self.assertEqual(len(combined["contexts"]), 3)
-        selected = [row for row in result["events"] if row["actor_group_key"] == combined["actor_key"]]
-        self.assertEqual(len(selected), 3)
-        self.assertEqual(len({row["actor_key"] for row in selected}), 3)
-        self.assertEqual(len(result["actors"]), 3)  # sql app_user, sql App_user, IAM app_user
+        self.assertNotIn("contexts", combined)
+        self.assertEqual(result["events"], [])
+        self.assertEqual(len(result["actors"]), 3)
         main = report.write_report(result, self.directory)
-        from urllib.parse import unquote
-        from test_report_pages import Links
-        parsed = Links()
-        parsed.feed(main.read_text(encoding="utf-8"))
-        filename = combined["anchor"] + "-000001.html"
-        actor_link = next(link for link in parsed.hrefs if link.endswith(filename))
-        markup = (self.directory / unquote(actor_link)).read_text(encoding="utf-8")
-        self.assertEqual(markup.count("data-event-index="), 3)
+        stored = (self.directory / "daily-report.json").read_text(encoding="utf-8")
         for sql in ("INSERT INTO t VALUES (1)", "UPDATE t SET x=2", "DELETE FROM t"):
-            self.assertIn(sql, markup)
-        self.assertIn("writer-a", main.read_text(encoding="utf-8"))
-        self.assertIn("writer-c", main.read_text(encoding="utf-8"))
+            self.assertNotIn(sql, stored)
+            self.assertNotIn(sql, main.read_text(encoding="utf-8"))
+        self.assertNotIn("writer-a", stored)
+        self.assertNotIn("writer-c", stored)
 
     def test_general_log_is_preserved_in_collection_but_not_double_counted(self):
         audit = audit_event()
@@ -136,14 +128,16 @@ class ReportFixture(unittest.TestCase):
         self.save([management("at-end", eventTime=report.iso(END))], [audit_event(when=START), audit_event(event_id="end", when=END)])
         result = self.build()
         self.assertEqual(result["metadata"]["total"], 1)
-        self.assertEqual(result["events"][0]["time_utc"], report.iso(START))
+        self.assertEqual(result["metadata"]["counts"]["修改"], 1)
 
     def test_multiline_sql_commas_and_escaped_quotes_survive(self):
         sql = "UPDATE users\nSET name=\\'a,b\\', note=\\'it\\\\s ok\\' WHERE id=1"
         self.save([], [audit_event(sql)])
-        row = self.build()["events"][0]
-        self.assertEqual(row["sql"], sql)
-        self.assertEqual(row["category"], "修改")
+        parsed = report.parse_audit_record(audit_event(sql)["message"], audit_event(sql))
+        self.assertEqual(parsed["sql"], sql)
+        result = self.build()
+        self.assertEqual(result["metadata"]["counts"]["修改"], 1)
+        self.assertNotIn(sql, json.dumps(result, ensure_ascii=False))
 
     def test_rds_mysql_connection_type_and_cloudwatch_timestamp_are_supported(self):
         event = audit_event("DELETE FROM t", aurora=False, connection_type="SSL/TLS")
@@ -177,7 +171,7 @@ class ReportFixture(unittest.TestCase):
         self.assertEqual(result["metadata"]["counts"]["删除"], 0)
         self.assertEqual(result["coverage"]["filtered_queries"], 2)
         self.assertEqual(result["coverage"]["unclassified"], 1)
-        self.assertEqual(result["unparsed"][0]["reason"], "unclassified_sql")
+        self.assertEqual(result["coverage"]["unknown_reasons"]["unclassified_sql"], 1)
         self.assertFalse(result["metadata"]["complete"])
         self.assertTrue(all(row["category"] in report.CHANGE_CATEGORIES for row in result["events"]))
 
@@ -188,7 +182,7 @@ class ReportFixture(unittest.TestCase):
         first["original_record_indexes"] = [2, 7]
         self.save([], [first])
         result = self.build()
-        self.assertEqual([row["event_id"] for row in result["events"]], ["s1:2", "s1:7"])
+        self.assertEqual(result["metadata"]["counts"], {"新增": 1, "删除": 0, "修改": 1, "其他操作": 0})
         self.assertEqual(result["metadata"]["total"], 2)
 
     def test_invalid_record_index_mapping_is_evidence_not_fake_change_ids(self):
@@ -198,7 +192,7 @@ class ReportFixture(unittest.TestCase):
         result = self.build()
         self.assertEqual(result["events"], [])
         self.assertFalse(result["metadata"]["complete"])
-        self.assertIn("original_record_indexes", result["unparsed"][0]["message"])
+        self.assertEqual(result["coverage"]["unknown_reasons"]["invalid_record_indexes"], 1)
 
     def test_collection_filter_totals_and_quarantine_are_combined_without_counting_uncertain_sql(self):
         unknown = audit_event("CALL f()", event_id="uncertain")
@@ -234,8 +228,9 @@ class ReportFixture(unittest.TestCase):
         self.assertFalse(result["metadata"]["complete"])
         self.assertEqual(result["metadata"]["total"], 0)
         self.assertEqual(result["coverage"]["unparsed_records"], 1)
-        self.assertIn("UPDATE users", result["unparsed"][0]["raw"])
-        self.assertIn("隔离证据", report.generate_html(result))
+        self.assertEqual(result["unparsed"], [])
+        self.assertNotIn("UPDATE users", json.dumps(result))
+        self.assertIn("当前汇总不完整", report.generate_html(result))
 
     def test_collection_errors_and_invalid_json_never_become_no_activity(self):
         self.collection["checks"] = [{"scope": "eu-north-1:cloudtrail", "status": "error", "message": "AccessDenied"}]
@@ -259,7 +254,7 @@ class ReportFixture(unittest.TestCase):
             self.assertNotIn(secret, markup)
             self.assertNotIn(secret, stored)
         self.assertNotIn("<script>", markup)
-        self.assertIn("&lt;script&gt;", markup)
+        self.assertNotIn("&lt;script&gt;", markup)  # Source IP is no longer exported.
         self.assertIn("<style", markup)
         self.assertIn('href="rds-report.css?v=', markup)
 

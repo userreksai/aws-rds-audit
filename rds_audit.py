@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only RDS management history and MySQL/Aurora MySQL audit-log collector.
+"""Read-only RDS management history and MySQL/Aurora MySQL user-summary collector.
 
 No database connections or configuration changes are made. See RDS_AUDIT.md.
 """
@@ -11,6 +11,7 @@ import json
 import re
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -28,7 +29,7 @@ PARAMETERS = {
     "binlog_expire_logs_seconds", "expire_logs_days", "log_bin", "aws_default_logs_role",
 }
 LIMITATIONS = [
-    "CloudTrail is RDS management API history, not ordinary database SQL history; only recognized create/delete/modify requests are retained, including failed requests.",
+    "CloudTrail is RDS management API history, not ordinary database SQL history; only recognized create/delete/modify requests are counted by user, including separate failure totals.",
     "Only the current account and selected Regions are queried. CloudTrail history is limited to 90 days; S3/Lake archives and Data API data events are not queried.",
     "RDS service notifications cover at most the last 14 days; they are not a record of all user actions.",
     "MySQL audit settings are current AWS control-plane configuration, not proof of effective runtime values or past audit coverage.",
@@ -37,7 +38,7 @@ LIMITATIONS = [
     "Audit SQL does not guarantee row-level before/after values or identify a human behind a shared database account.",
     "CloudWatch discovery covers standard /aws/rds/instance|cluster/<id>/audit|general groups, including retained groups for deleted databases; custom destinations are not discovered.",
     "Database TABLE log destinations (mysql.general_log), slow-query logs, binary logs, and Database Activity Stream payloads are not collected by this script.",
-    "Instance-log downloads preserve whole currently visible audit/general files, without the requested time filter. Live files can change during collection.",
+    "Only user counts are retained; raw SQL, execution details and per-statement alerts are disabled.",
 ]
 
 
@@ -136,19 +137,30 @@ def daily_window(value: str | None, now: datetime) -> tuple[str, datetime, datet
 
 def iter_items(client, operation, result_key, *, request_token="Marker", response_token="Marker", delay=0, **kwargs):
     """Continue even after empty pages; fail loudly if an API repeats its cursor."""
-    tokens = set()
-    while True:
-        response = getattr(client, operation)(**kwargs)
-        yield from response.get(result_key, [])
-        token = response.get(response_token)
-        if not token:
-            return
-        if token in tokens:
-            raise RuntimeError(f"{operation}: repeated pagination token; results are incomplete")
-        tokens.add(token)
-        kwargs[request_token] = token
-        if delay:
-            time.sleep(delay)
+    tokens = None
+    try:
+        while True:
+            response = getattr(client, operation)(**kwargs)
+            yield from response.get(result_key, [])
+            token = response.get(response_token)
+            if not token:
+                return
+            if tokens is None:
+                # Empty filename uses an automatically deleted SQLite temporary
+                # database; page count must not grow the process's Python heap.
+                tokens = sqlite3.connect("")
+                tokens.execute("PRAGMA journal_mode=OFF")
+                tokens.execute("PRAGMA cache_size=-256")
+                tokens.execute("CREATE TABLE cursors (digest BLOB PRIMARY KEY) WITHOUT ROWID")
+            digest = hashlib.sha256(str(token).encode()).digest()
+            if not tokens.execute("INSERT OR IGNORE INTO cursors VALUES(?)", (digest,)).rowcount:
+                raise RuntimeError(f"{operation}: repeated pagination token; results are incomplete")
+            kwargs[request_token] = token
+            if delay:
+                time.sleep(delay)
+    finally:
+        if tokens is not None:
+            tokens.close()
 
 
 def safe_name(value: str) -> str:
@@ -196,12 +208,13 @@ class Collector:
             "started_at": iso(datetime.now(UTC)),
             "window": {"start_inclusive": iso(start), "end_exclusive": iso(end)},
             "scope": "Current account; RDS management history; MySQL/Aurora MySQL SQL audit inspection",
-            "operation_scope": "changes_only",
+            "operation_scope": "changes_only", "summary_only": True,
             "sql_log_download_requested": args.download_sql_logs,
             "instance_log_download_requested": args.download_instance_logs,
             "limitations": LIMITATIONS, "checks": [], "regions": {},
         }
         self.parameter_cache, self.option_cache = {}, {}
+        self.accumulator = None
 
     def client(self, service, region):
         return self.session.client(service, region_name=region, config=self.config)
@@ -233,10 +246,7 @@ class Collector:
         return result
 
     def management_events(self, region, handle, summary):
-        from rds_change_filter import keep_management_event
-
         ct = self.client("cloudtrail", region)
-        seen = set()
         for event in iter_items(
             ct, "lookup_events", "Events", request_token="NextToken", response_token="NextToken", delay=0.55,
             LookupAttributes=[{"AttributeKey": "EventSource", "AttributeValue": "rds.amazonaws.com"}],
@@ -244,16 +254,13 @@ class Collector:
         ):
             if not in_window(event["EventTime"], self.start, self.end):
                 continue
-            event_id = event["EventId"]
-            if event_id in seen:
-                continue
-            seen.add(event_id)
             raw = json.loads(event["CloudTrailEvent"])
-            if not keep_management_event({**raw, "readOnly": raw.get("readOnly", event.get("ReadOnly", False))}):
-                summary["filtered_management_event_count"] = summary.get("filtered_management_event_count", 0) + 1
-                continue
-            write_json_line(handle, {"region": region, "event": raw, "lookup": {k: v for k, v in event.items() if k != "CloudTrailEvent"}})
-            summary["management_event_count"] += 1
+            result = self.accumulator.process_management({
+                "region": region, "event": raw,
+                "lookup": {key: value for key, value in event.items() if key != "CloudTrailEvent"},
+            })
+            summary["management_event_count"] += result.get("change_records", 0)
+            summary["filtered_management_event_count"] = summary.get("filtered_management_event_count", 0) + result.get("filtered_management", 0)
 
     def service_events(self, region, rds, handle, summary):
         # AWS's rolling 14-day limit advances while this process runs.
@@ -350,8 +357,6 @@ class Collector:
                 row["download"].update(status="ok", **result)
 
     def cloudwatch(self, region, summary):
-        from rds_change_filter import audit_event_decision
-
         logs = self.client("logs", region)
         for group in iter_items(
             logs, "describe_log_groups", "logGroups", request_token="nextToken", response_token="nextToken",
@@ -360,95 +365,75 @@ class Collector:
             name = group["logGroupName"]
             if not re.fullmatch(r"/aws/rds/(instance|cluster)/[^/]+/(audit|general)", name):
                 continue
-            print(f"{region}: 已发现 SQL 日志组 {name}", flush=True)
             item = {key: group[key] for key in ("logGroupName", "retentionInDays", "storedBytes", "creationTime", "logGroupClass") if key in group}
             summary["sql_log_groups"].append(item)
             if not self.args.download_sql_logs:
                 item["download"] = {"status": "not_requested"}
-                print(f"{region}: {name} 仅列目录，未请求下载日志。", flush=True)
                 continue
             if name.endswith("/general"):
-                item["download"] = {"status": "skipped_read_logs", "reason": "仅增删改模式使用 audit 审计记录，general 正文不采集，避免保留大量查询或重复计数。"}
-                print(f"{region}: {name} 跳过 general 正文（仅采集 audit 增删改）。", flush=True)
+                item["download"] = {"status": "skipped_read_logs"}
                 continue
-            directory = self.directory / "cloudwatch"
-            directory.mkdir(exist_ok=True)
-            path = directory / (safe_name(f"{region}/{name}") + ".jsonl")
-            item["download"] = {"path": str(path.relative_to(self.directory)), "status": "error", "event_count": 0,
-                                "received_event_count": 0, "change_record_count": 0, "filtered_read_record_count": 0,
-                                "filtered_auxiliary_record_count": 0, "quarantined_record_count": 0}
+            counts = item["download"] = {
+                "status": "error", "summary_only": True, "event_count": 0,
+                "received_event_count": 0, "change_record_count": 0,
+                "filtered_read_record_count": 0, "filtered_auxiliary_record_count": 0,
+                "quarantined_record_count": 0,
+            }
 
-            def download():
-                quarantine = None
-                try:
-                    with path.open("x", encoding="utf-8", newline="\n") as handle:
-                        for event in iter_items(
-                            logs, "filter_log_events", "events", request_token="nextToken", response_token="nextToken",
-                            logGroupName=name, startTime=int(self.start.timestamp() * 1000), endTime=int(self.end.timestamp() * 1000),
-                        ):
-                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, UTC)
-                            if not in_window(timestamp, self.start, self.end):
-                                continue
-                            counts = item["download"]
-                            counts["received_event_count"] += 1
-                            envelope = {"region": region, "logGroupName": name, **event}
-                            decision = audit_event_decision(envelope)
-                            counts["change_record_count"] += decision["change_records"]
-                            counts["filtered_read_record_count"] += decision["read_records"]
-                            counts["filtered_auxiliary_record_count"] += decision["auxiliary_records"]
-                            if decision["unknown_records"]:
-                                if quarantine is None:
-                                    quarantine_path = self.directory / "quarantine" / "sql-unclassified.jsonl"
-                                    quarantine_path.parent.mkdir(exist_ok=True)
-                                    quarantine = quarantine_path.open("a", encoding="utf-8", newline="\n")
-                                    counts["quarantine_path"] = str(quarantine_path.relative_to(self.directory))
-                                for evidence in decision["unknown_records"]:
-                                    write_json_line(quarantine, evidence)
-                                    counts["quarantined_record_count"] += 1
-                            if not decision["keep"]:
-                                continue
-                            envelope["message"] = "\n".join(segment["raw"] for segment in decision["retained_segments"])
-                            envelope["original_record_indexes"] = [segment["record_index"] for segment in decision["retained_segments"]]
-                            write_json_line(handle, envelope)
-                            counts["event_count"] += 1
-                finally:
-                    if quarantine is not None:
-                        quarantine.close()
-                item["download"]["status"] = "ok"
+            def aggregate():
+                for event in iter_items(
+                    logs, "filter_log_events", "events", request_token="nextToken", response_token="nextToken",
+                    logGroupName=name, startTime=int(self.start.timestamp() * 1000), endTime=int(self.end.timestamp() * 1000),
+                ):
+                    occurred = datetime.fromtimestamp(event["timestamp"] / 1000, UTC)
+                    if not in_window(occurred, self.start, self.end):
+                        continue
+                    counts["received_event_count"] += 1
+                    decision = self.accumulator.process_audit({"region": region, "logGroupName": name, **event})
+                    counts["change_record_count"] += decision["change_records"]
+                    counts["filtered_read_record_count"] += decision["read_records"]
+                    counts["filtered_auxiliary_record_count"] += decision["auxiliary_records"]
+                    counts["quarantined_record_count"] += decision["unknown_records"]
+                    counts["event_count"] += bool(decision["change_records"])
+                counts["status"] = "ok"
 
-            self.check(f"{region}:download_cloudwatch:{name}", download)
-            if item["download"]["status"] == "ok":
-                counts = item["download"]
-                print(f"{region}: {name} 接收候选事件 {counts['received_event_count']} 条，保留含增删改事件 {counts['event_count']} 条（增删改记录 {counts['change_record_count']} 条），排除查询 {counts['filtered_read_record_count']} 条、辅助记录 {counts['filtered_auxiliary_record_count']} 条；文件 {path.resolve()}", flush=True)
-                if counts["quarantined_record_count"]:
-                    self.report["checks"].append({"scope": f"{region}:classify_sql:{name}", "status": "error", "error_type": "UnclassifiedSqlRecords", "message": f"{counts['quarantined_record_count']} 条无法确定为增删改的记录已独立留档；请检查 {counts['quarantine_path']}"})
-                    print(f"{region}: 隔离未识别审计记录 {counts['quarantined_record_count']} 条；未混入增删改汇总。", flush=True)
-                if not counts["received_event_count"]:
-                    print(f"{region}: 当前查询窗口未取得已保留的日志事件，不能据此判断没有 SQL 操作；请核对产生日志的时间与保留范围。", flush=True)
-                elif not counts["change_record_count"]:
-                    print(f"{region}: 查询窗口内没有取得可可靠识别的增删改记录；已知查询/辅助记录已排除，未知记录单独留档。", flush=True)
+            self.check(f"{region}:aggregate_cloudwatch:{name}", aggregate)
+            if counts["quarantined_record_count"]:
+                self.report["checks"].append({
+                    "scope": f"{region}:classify_sql:{name}", "status": "error", "error_type": "UnclassifiedSqlRecords",
+                    "message": f"{counts['quarantined_record_count']} 条审计记录无法可靠分类，已仅保存问题计数；未计入增删改。",
+                })
+            print(f"{region}: {name} 已读取候选事件 {counts['received_event_count']} 条，汇总增删改 {counts['change_record_count']} 条；不保存日志正文。", flush=True)
 
     def run(self):
+        from rds_summary import SummaryAccumulator
+
         try:
-            regions = self.regions()
-            self.report["selected_regions"] = regions
-            with (self.directory / "management-events.jsonl").open("x", encoding="utf-8") as management, (self.directory / "rds-events.jsonl").open("x", encoding="utf-8") as events:
+            if self.args.download_instance_logs:
+                raise ValueError("仅汇总模式不支持下载实例原始日志")
+            with SummaryAccumulator(self.directory, self.start, self.end) as accumulator:
+                self.accumulator = accumulator
+                regions = self.regions()
+                self.report["selected_regions"] = regions
                 for region in regions:
-                    print(f"查询区域 {region} …", flush=True)
                     summary = {"management_event_count": 0, "rds_service_event_count": 0, "instances": [], "clusters": [], "sql_log_groups": [], "notes": []}
                     self.report["regions"][region] = summary
-                    self.check(f"{region}:cloudtrail", lambda: self.management_events(region, management, summary))
-                    rds = self.check(f"{region}:initialize_rds_client", lambda: self.client("rds", region))
-                    if rds is not None and not getattr(self.args, "metadata_light", False):
-                        self.check(f"{region}:service_events", lambda: self.service_events(region, rds, events, summary))
-                        self.check(f"{region}:inventory", lambda: self.inventory(region, rds, summary))
+                    self.check(f"{region}:cloudtrail", lambda: self.management_events(region, None, summary))
+                    if not getattr(self.args, "metadata_light", False):
+                        rds = self.check(f"{region}:initialize_rds_client", lambda: self.client("rds", region))
+                        if rds is not None:
+                            self.check(f"{region}:inventory", lambda: self.inventory(region, rds, summary))
                     self.check(f"{region}:cloudwatch_discovery", lambda: self.cloudwatch(region, summary))
                     if not summary["sql_log_groups"]:
-                        summary["notes"].append("未发现标准路径的 audit/general 日志组；请检查查询状态、实际生效配置、本地日志及自定义日志目的地。")
+                        summary["notes"].append("未发现标准 audit/general 日志组，不能据此判断没有数据库操作。")
+                payload = accumulator.finish()
+                if not payload.get("complete", True) and not any(check.get("error_type") == "UnclassifiedSqlRecords" for check in self.report["checks"]):
+                    self.report["checks"].append({"scope": "summary_quality", "status": "error", "error_type": "UnclassifiedSqlRecords", "message": "部分记录无法可靠解析或去重，仅保存问题计数，未冒充完整汇总。"})
         except Exception as exc:
             self.report["checks"].append({"scope": "collection", "status": "error", "error_type": type(exc).__name__, "message": str(exc)})
             print(f"[部分失败] 采集未完成: {exc}", file=sys.stderr)
         finally:
+            self.accumulator = None
             self.report["finished_at"] = iso(datetime.now(UTC))
             errors = sum(check["status"] == "error" for check in self.report["checks"])
             self.report["collection_status"] = "partial" if errors else "ok"
@@ -459,25 +444,25 @@ class Collector:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="只读导出 RDS 管理操作、检查 MySQL/Aurora MySQL 审计配置并下载已有日志")
+    parser = argparse.ArgumentParser(description="只读采集 RDS 审计日志，生成按用户的增删改汇总，不保存SQL正文或执行明细")
     parser.add_argument("--profile", help="AWS 配置名；省略时使用 boto3 默认凭据链")
     parser.add_argument("--regions", type=validate_regions, default="all", help="all 或逗号分隔的区域；默认 all")
     parser.add_argument("--discovery-region", help="区域发现/STS 使用的区域，默认 SDK 配置区域或 us-east-1")
     parser.add_argument("--days", type=float, help="最近天数，默认 7，小于 90；与 start/end 互斥")
     parser.add_argument("--start", type=parse_timestamp, help="开始时间（含时区），包含该时刻")
     parser.add_argument("--end", type=parse_end_timestamp, help="结束时间（含时区或 now），不包含该时刻")
-    parser.add_argument("--since-yesterday-7", action="store_true", help="查询昨日北京时间07:00至当前时间，自动下载已有audit SQL正文")
+    parser.add_argument("--since-yesterday-7", action="store_true", help="查询昨日北京时间07:00至当前时间，读取audit日志并即时汇总，不保存正文")
     parser.add_argument("--output-dir", type=Path, default=Path("reports/rds"), help="输出父目录，每次运行新建子目录")
-    parser.add_argument("--download-sql-logs", action="store_true", help="导出已有 CloudWatch audit/general 日志原文")
-    parser.add_argument("--download-instance-logs", action="store_true", help="备用：下载全部当前可见 audit/general 实例日志整文件，会使用实例资源")
-    parser.add_argument("--daily", action="store_true", help="生成北京时间昨天07:00至今天08:00的HTML日报，默认下载已有CloudWatch SQL日志")
+    parser.add_argument("--download-sql-logs", action="store_true", help="读取已有 CloudWatch audit 日志并汇总，不保存正文")
+    parser.add_argument("--download-instance-logs", action="store_true", help="已停用：仅汇总模式不允许下载实例原始日志")
+    parser.add_argument("--daily", action="store_true", help="生成北京时间昨天07:00至今天08:00的HTML日报，读取CloudWatch audit日志并仅保存用户汇总")
     parser.add_argument("--date", help="日报窗口结束日期 YYYY-MM-DD，默认北京时间今天")
     parser.add_argument("--input-dir", type=Path, help="按已有采集目录的原始窗口离线生成HTML；加--daily/--date时生成固定日报，不连接AWS")
     publication = parser.add_mutually_exclusive_group()
     publication.add_argument("--publish-dir", type=Path, default=DEFAULT_PUBLISH_DIR, help="整套报告网页发布目录，默认项目下index/，首页index.html")
     publication.add_argument("--no-publish", dest="publish_dir", action="store_const", const=None, help="仅生成归档，不更新网页发布目录")
     parser.add_argument("--send-lark", action="store_true", help="生成HTML后向配置的Lark群发送汇总")
-    parser.add_argument("--sql-alerts", action=argparse.BooleanOptionalAction, default=True, help="增量采集发现新的删除/修改SQL时发送Lark告警，须同时开启--send-lark；--no-sql-alerts关闭")
+    parser.add_argument("--sql-alerts", action=argparse.BooleanOptionalAction, default=False, help="逐条SQL告警已停用；兼容--no-sql-alerts，拒绝启用")
     parser.add_argument("--sql-alert-commands", type=parse_sql_alert_commands, default=("DELETE", "UPDATE", "DROP", "TRUNCATE", "ALTER"), help="SQL即时告警命令，默认 DELETE,UPDATE,DROP,TRUNCATE,ALTER")
     parser.add_argument("--lark-config", type=Path, default=Path("lark-config.json"), help="Lark私有配置路径")
     parser.add_argument("--check-config", action="store_true", help="只检查AWS身份/可见资源读取权限及可选Lark配置，不生成报告、不发消息")
@@ -708,6 +693,10 @@ def main(argv=None):
         return 0 if exc.code == 0 else 1
     try:
         validate_query_shortcut(args)
+        if args.sql_alerts:
+            raise ValueError("仅汇总模式不支持 --sql-alerts；请移除该参数或使用 --no-sql-alerts")
+        if args.download_instance_logs:
+            raise ValueError("仅汇总模式不支持 --download-instance-logs；不会下载或保存原始SQL")
         if sum(bool(flag) for flag in (args.collect_incremental, args.from_cache, args.notify_service_failure)) > 1:
             raise ValueError("增量采集、缓存汇总和服务失败告警模式不能同时使用")
         if args.check_config:

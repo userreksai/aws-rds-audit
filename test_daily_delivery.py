@@ -67,6 +67,15 @@ class RdsLarkTests(unittest.TestCase):
         self.assertNotIn("MUST-NOT-LEAK", text)
         self.assertNotIn("v668live", text)
 
+    def test_user_summaries_include_counts_but_never_statement_details(self):
+        report = example_report()
+        report["actors"] = [{"actor": "operator-" + str(index), "actor_type": "数据库账号", "counts": {"新增": 2, "删除": 3, "修改": 4}, "failed": 1, "sql": "MUST-NOT-LEAK"} for index in range(25)]
+        text = notify.build_lark_payloads(report, {"message_mode": "overview"})[0]["content"]["text"]
+        self.assertIn("operator-0（数据库账号）：2 / 3 / 4；失败 1", text)
+        self.assertIn("前 20 位", text)
+        self.assertNotIn("operator-24", text)
+        self.assertNotIn("MUST-NOT-LEAK", text)
+
     def test_rds_link_filename_and_signature(self):
         report = example_report()
         link = notify.format_report_url("https://reports.example.invalid/{account_id}/{filename}", report)
