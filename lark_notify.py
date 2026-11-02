@@ -153,12 +153,22 @@ def build_lark_payloads(report, config, *, access_password=None):
     for key, label in (("management", "RDS管理API"), ("sql", "数据库SQL审计")):
         values = sources.get(key, {})
         lines.append(label + "：" + "　".join(f"{name} {int(values.get(name, 0))}" for name in ("新增", "删除", "修改")))
-    lines.append(f"全部明细 {int(meta.get('total', 0))} 条；失败或含失败响应 {int(meta.get('failed_or_partial', 0))} 条。")
+    actors = report.get("actors", [])
+    if actors:
+        lines.append("按用户汇总（新增 / 删除 / 修改；失败另计）：")
+        for actor in actors[:20]:
+            values = actor.get("counts", {})
+            lines.append("{}（{}）：{} / {} / {}；失败 {}".format(
+                _fragment(actor.get("actor", ""), 100), _fragment(actor.get("actor_type", ""), 30),
+                *(int(values.get(key, 0)) for key in ("新增", "删除", "修改")), int(actor.get("failed", 0))))
+        if len(actors) > 20:
+            lines.append(f"共 {len(actors)} 位操作者，此处显示前 20 位；全部用户见汇总报告。")
+    lines.append(f"已汇总请求 {int(meta.get('total', 0))} 条；失败或含失败响应 {int(meta.get('failed_or_partial', 0))} 条。")
     lines.append("账号：" + _fragment(meta['account_id'], 64))
     lines.append("北京时间：" + _beijing(meta['window_start_utc']) + " 至 " + _beijing(meta['window_end_utc_exclusive']))
     lines.append("SQL仅覆盖已记录且仍保留的审计日志；数据库账号不一定对应具体自然人。")
     report_url = format_report_url(config.get("report_url_template", ""), report)
-    lines.append("详细报告：" + report_url if report_url else "详细报告已保存在服务器；尚未配置可访问链接。")
+    lines.append("汇总报告：" + report_url if report_url else "汇总报告已保存在服务器；尚未配置可访问链接。")
     return [{"msg_type": "text", "content": {"text": "\n".join(lines)}}]
 
 
@@ -246,11 +256,12 @@ def send_lark_notification(report, config, *, opener=None, now=None, sleep=None,
 
 
 def send_lark_alert(alert, config, *, opener=None, now=None):
-    """Operational alerts omit SQL; explicit SQL-change alerts contain a bounded excerpt."""
+    """Send operational status only; reject legacy SQL-change payloads."""
     kind = str(alert.get("type") or alert.get("kind") or "collection_failure")
     recovered = "recover" in kind or "recovery" in kind
-    sql_change = kind == "sql_change"
-    title = "RDS采集告警｜SQL 删除/修改" if sql_change else "RDS采集恢复通知" if recovered else "RDS采集告警"
+    if kind == "sql_change":
+        raise ValueError("仅汇总模式已停用逐条SQL通知；历史SQL告警队列不再发送")
+    title = "RDS采集恢复通知" if recovered else "RDS采集告警"
     lines = [title, "事件：" + _fragment(kind, 80)]
     for key, label in (("event_id", "事件编号"), ("account_id", "账号"), ("regions", "区域"), ("source_service", "服务"), ("bucket_start", "分段开始"), ("bucket_end", "分段结束"), ("start", "开始"), ("end", "结束"), ("attempts", "累计尝试"), ("missing_count", "缺失分段数"), ("occurred_at", "记录时间")):
         if alert.get(key) is not None:
@@ -258,16 +269,13 @@ def send_lark_alert(alert, config, *, opener=None, now=None):
     message = str(alert.get("message") or alert.get("error") or alert.get("last_error") or "请检查服务器采集状态和日志。")
     # Apply common credential-key redaction to unexpected transport diagnostics.
     message = re.sub(r"(?i)(secret(?:accesskey)?|sessiontoken|password|webhook|authorization)\s*[=:]\s*\S+", r"\1=[REDACTED]", message)
-    if sql_change:
-        lines.extend(_fragment(line, 1800) for line in message.splitlines())
-    else:
-        lines.append("信息：" + _fragment(message, 900))
+    lines.append("信息：" + _fragment(message, 900))
     lines.append("服务器日志：journalctl -u aws-rds-audit-collect.service -n 100 --no-pager")
     payload = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
     webhook = validate_webhook_url(config.get("webhook_url", ""))
     signed = _signed_payload(payload, config.get("signing_secret", ""), now)
     if len(_payload_bytes(signed)) > 20 * 1024:
-        raise LarkNotificationError("Lark告警超过20KB，未发送；请缩短SQL摘要或减少单批数量。")
+        raise LarkNotificationError("Lark告警超过20KB，未发送；请缩短诊断信息。")
     return _send_payload(signed, webhook, opener)
 
 

@@ -44,6 +44,20 @@ def collector(path, cli_args=None, session=None, start=START, end=END):
     )
 
 
+def aggregate_cloudwatch(c, region, counts):
+    from rds_summary import SummaryAccumulator
+    with SummaryAccumulator(c.directory, c.start, c.end) as c.accumulator:
+        c.cloudwatch(region, counts)
+        return c.accumulator.finish()
+
+
+def aggregate_management(c, region, counts):
+    from rds_summary import SummaryAccumulator
+    with SummaryAccumulator(c.directory, c.start, c.end) as c.accumulator:
+        c.management_events(region, None, counts)
+        return c.accumulator.finish()
+
+
 def cloudtrail_event(event_id, name, when, read_only):
     raw = {
         "eventID": event_id, "eventName": name, "eventTime": audit.iso(when),
@@ -134,10 +148,10 @@ class ManagementHistoryTests(unittest.TestCase):
             stub.add_response("lookup_events", {"Events": rows}, request)
             c = collector(directory, session=Mock(client=Mock(return_value=client)))
             output, counts = io.StringIO(), summary()
-            c.management_events(REGION, output, counts)
-            result = [json.loads(line) for line in output.getvalue().splitlines()]
-            self.assertEqual([row["event"]["eventID"] for row in result], ["write"])
-            self.assertEqual(result[0]["event"]["requestParameters"]["dBInstanceIdentifier"], "deleted-db")
+            result = aggregate_management(c, REGION, counts)
+            self.assertEqual(result["actors"][0]["counts"]["删除"], 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertNotIn("requestParameters", json.dumps(result))
             self.assertEqual(counts["management_event_count"], 1)
             self.assertEqual(counts["filtered_management_event_count"], 1)
             stub.assert_no_pending_responses()
@@ -182,15 +196,19 @@ class CloudWatchTests(unittest.TestCase):
             root = Path(directory)
             c = collector(root, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
             counts = summary()
-            c.cloudwatch(REGION, counts)
-            saved = next((root / "cloudwatch").glob("*.jsonl")).read_text(encoding="utf-8")
+            payload = aggregate_cloudwatch(c, REGION, counts)
+            saved = (root / "operation-summary.json").read_text(encoding="utf-8")
             self.assertNotIn("private_read_value", saved)
-            self.assertEqual(json.loads(saved)["original_record_indexes"], [1, 2])
+            self.assertNotIn("INSERT INTO", saved)
+            self.assertFalse((root / "cloudwatch").exists())
+            self.assertEqual(payload["actors"][0]["counts"]["新增"], 1)
+            self.assertEqual(payload["actors"][0]["failed"], 1)
             c.report.update(collection_status="ok", regions={REGION: counts}, sql_log_download_requested=True)
             (root / "report.json").write_text(json.dumps(c.report), encoding="utf-8")
             (root / "management-events.jsonl").write_text("", encoding="utf-8")
             report = rds_report.build_daily_report(root, audit_date="2026-10-28", start=START, end=END, period_kind="custom")
-            self.assertEqual({row["event_id"] for row in report["events"]}, {"mixed:1", "mixed:2"})
+            self.assertEqual(report["events"], [])
+            self.assertEqual(report["metadata"]["total"], 2)
             self.assertEqual(report["metadata"]["counts"]["新增"], 1)
             self.assertEqual(report["metadata"]["counts"]["删除"], 0)
             self.assertEqual(report["metadata"]["failed_or_partial"], 1)
@@ -204,10 +222,10 @@ class CloudWatchTests(unittest.TestCase):
             c = collector(directory, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
             counts, output = summary(), io.StringIO()
             with redirect_stdout(output):
-                c.cloudwatch("ap-east-1", counts)
+                aggregate_cloudwatch(c, "ap-east-1", counts)
             self.assertEqual(len(counts["sql_log_groups"]), 1)
             self.assertEqual(counts["sql_log_groups"][0]["download"]["event_count"], 1)
-            self.assertIn("保留含增删改事件 1 条", output.getvalue())
+            self.assertIn("汇总增删改 1 条", output.getvalue())
             self.assertNotIn("private_business_value", output.getvalue())
             client.filter_log_events.assert_called_once()
 
@@ -224,14 +242,14 @@ class CloudWatchTests(unittest.TestCase):
             stub.add_response("filter_log_events", {"events": events}, {**base_request, "nextToken": "continue"})
             c = collector(directory, cli_args=args("--download-sql-logs"), session=Mock(client=Mock(return_value=client)))
             counts = summary()
-            c.cloudwatch(REGION, counts)
+            result = aggregate_cloudwatch(c, REGION, counts)
             item = counts["sql_log_groups"][0]
-            output = Path(directory) / item["download"]["path"]
-            result = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([row["message"] for row in result], [events[2]["message"]])
+            self.assertEqual(result["actors"][0]["counts"]["修改"], 1)
+            self.assertFalse(result["complete"])
+            self.assertNotIn("CALL change_balance", json.dumps(result))
             self.assertEqual(item["download"]["event_count"], 1)
             self.assertEqual(item["download"]["quarantined_record_count"], 2)
-            self.assertTrue((Path(directory) / "quarantine/sql-unclassified.jsonl").is_file())
+            self.assertFalse((Path(directory) / "quarantine").exists())
             self.assertEqual(item["download"]["status"], "ok")
             self.assertEqual(counts["instances"], [])
             stub.assert_no_pending_responses()
@@ -339,7 +357,8 @@ class CoverageTests(unittest.TestCase):
             self.assertEqual(report["historical_sql_completeness"], "not_established")
             self.assertEqual(list(report["regions"]), [first, second])
             cloudtrail_b.lookup_events.assert_called_once()
-            self.assertTrue((Path(directory) / "management-events.jsonl").exists())
+            self.assertTrue((Path(directory) / "operation-summary.json").exists())
+            self.assertFalse((Path(directory) / "management-events.jsonl").exists())
 
 
 if __name__ == "__main__":

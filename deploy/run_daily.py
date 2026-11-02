@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""systemd entry point: select a completed Beijing window and prevent overlaps."""
+"""Run a completed Beijing summary window and prevent overlapping deliveries."""
 from __future__ import annotations
 
 import argparse
@@ -60,7 +60,7 @@ def drop_to_user(username: str) -> None:
 
 
 def build_command(environment: dict[str, str], *, check=False, now=None) -> list[str]:
-    command = [sys.executable, str(PROJECT / "rds_audit.py")]
+    command = [sys.executable, str(PROJECT / "rds_audit.py"), "--no-sql-alerts"]
     if check:
         command.append("--check-config")
     else:

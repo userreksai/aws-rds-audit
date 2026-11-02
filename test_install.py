@@ -98,24 +98,41 @@ class IncrementalCommandTests(unittest.TestCase):
         for values in ({}, {"AWS_RDS_PUBLISH_DIR": ""}):
             command = collect_runner.build_command(values)
             self.assertEqual(command[command.index("--publish-dir") + 1], str(collect_runner.PROJECT / "index"))
-    def test_sql_alerts_are_enabled_with_all_five_requested_commands_by_default(self):
+    def test_summary_collection_always_disables_sql_detail_notifications(self):
         command = collect_runner.build_command({})
-        self.assertIn("--sql-alerts", command)
-        self.assertNotIn("--no-sql-alerts", command)
-        self.assertEqual(command[command.index("--sql-alert-commands") + 1], "DELETE,UPDATE,DROP,TRUNCATE,ALTER")
+        self.assertIn("--no-sql-alerts", command)
+        self.assertNotIn("--sql-alerts", command)
+        self.assertNotIn("--sql-alert-commands", command)
 
-    def test_sql_alert_settings_keep_user_disable_and_normalize_selected_commands(self):
+    def test_legacy_enabled_alert_environment_cannot_reenable_sql_notifications(self):
+        command = collect_runner.build_command({"AWS_RDS_SQL_ALERTS": "1", "AWS_RDS_SQL_ALERT_COMMANDS": "UPDATE,DELETE"})
+        self.assertIn("--no-sql-alerts", command)
+        self.assertNotIn("--sql-alerts", command)
+        self.assertNotIn("--sql-alert-commands", command)
+
+    def test_legacy_command_selections_do_not_affect_summary_collection(self):
         command = collect_runner.build_command({"AWS_RDS_SQL_ALERTS": "0", "AWS_RDS_SQL_ALERT_COMMANDS": " update, delete,UPDATE "})
         self.assertIn("--no-sql-alerts", command)
         self.assertNotIn("--sql-alerts", command)
-        self.assertEqual(command[command.index("--sql-alert-commands") + 1], "UPDATE,DELETE")
+        self.assertNotIn("--sql-alert-commands", command)
 
-    def test_invalid_sql_alert_settings_are_rejected_before_launch(self):
+    def test_obsolete_alert_settings_cannot_stop_summary_collection(self):
         for environment in ({"AWS_RDS_SQL_ALERTS": "yes"}, {"AWS_RDS_SQL_ALERTS": ""},
                             {"AWS_RDS_SQL_ALERT_COMMANDS": "SELECT"}, {"AWS_RDS_SQL_ALERT_COMMANDS": "DELETE,"},
                             {"AWS_RDS_SQL_ALERT_COMMANDS": "UPDATE,$(command)"}, {"AWS_RDS_SQL_ALERT_COMMANDS": ""}):
-            with self.subTest(environment=environment), self.assertRaises(ValueError):
-                collect_runner.build_command(environment)
+            with self.subTest(environment=environment):
+                command = collect_runner.build_command(environment)
+                self.assertIn("--no-sql-alerts", command)
+                self.assertNotIn("--sql-alerts", command)
+                self.assertNotIn("--sql-alert-commands", command)
+
+    def test_install_migration_overrides_enabled_switch_without_changing_private_settings(self):
+        existing = {"AWS_RDS_SQL_ALERTS": "1", "AWS_PROFILE": "private-profile", "AWS_RDS_LARK_CONFIG": "/private/lark.json"}
+        effective = {**existing, **collect_runner.summary_environment_updates()}
+        self.assertEqual(effective["AWS_RDS_SQL_ALERTS"], "0")
+        self.assertEqual(effective["AWS_PROFILE"], existing["AWS_PROFILE"])
+        self.assertEqual(effective["AWS_RDS_LARK_CONFIG"], existing["AWS_RDS_LARK_CONFIG"])
+        self.assertIn("--no-sql-alerts", collect_runner.build_command(effective))
 
     def test_collection_has_a_bounded_cache_schedule_and_keeps_profile_arguments(self):
         command = collect_runner.build_command({

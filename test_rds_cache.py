@@ -18,10 +18,15 @@ def stamp(value):
 
 
 def snapshot(start, end, directory, marker="one", *, status="ok", checks=None):
-    source = {"identity": {"Account": ACCOUNT}, "window": {"start_inclusive": stamp(start), "end_exclusive": stamp(end)}, "collection_status": status, "checks": checks or [], "regions": {"ap-east-1": {"filtered_management_event_count": 2, "sql_log_groups": []}}}
+    from rds_summary import SummaryAccumulator
+    source = {"summary_only": True, "identity": {"Account": ACCOUNT}, "window": {"start_inclusive": stamp(start), "end_exclusive": stamp(end)}, "collection_status": status, "checks": checks or [], "regions": {"ap-east-1": {"filtered_management_event_count": 2, "sql_log_groups": []}}}
     (directory / "report.json").write_text(json.dumps(source), encoding="utf-8")
-    (directory / "management-events.jsonl").write_text(json.dumps({"marker": marker}) + "\n", encoding="utf-8")
-    (directory / "rds-events.jsonl").write_text("", encoding="utf-8")
+    with SummaryAccumulator(directory, start, end) as accumulator:
+        accumulator.process_management({"region": "ap-east-1", "event": {
+            "eventID": str(int(start.timestamp())), "eventName": "CreateDBInstance", "eventTime": stamp(start),
+            "userIdentity": {"type": "IAMUser", "userName": marker, "arn": "arn:aws:iam::123456789012:user/" + marker},
+        }})
+        accumulator.finish()
     return 0
 
 
@@ -116,7 +121,9 @@ class CacheFixture(unittest.TestCase):
         self.store.run_due(NOW, snapshot, max_buckets=1, lookback_hours=1)
         full = self.store.assemble_window(start, end, self.root / "full")
         self.assertEqual(full["collection_status"], "ok")
-        self.assertEqual(len((self.root / "full/management-events.jsonl").read_text().splitlines()), 2)
+        self.assertFalse((self.root / "full/management-events.jsonl").exists())
+        payload = json.loads((self.root / "full/operation-summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["actors"][0]["total"], 2)
 
     def test_late_refresh_replaces_snapshot_and_content_fingerprint_is_stable(self):
         self.store.run_due(NOW, snapshot, max_buckets=2, lookback_hours=1)
@@ -129,9 +136,9 @@ class CacheFixture(unittest.TestCase):
         result = self.store.run_due(NOW + timedelta(hours=1), refreshed, max_buckets=6, lookback_hours=2)
         self.assertGreaterEqual(result["changed"], 1)
         after = self.store.assemble_window(start, end, self.root / "after")
-        rows = (self.root / "after/management-events.jsonl").read_text().splitlines()
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(json.loads(row)["marker"] == "newest" for row in rows))
+        payload = json.loads((self.root / "after/operation-summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["actors"][0]["total"], 2)
+        self.assertEqual(payload["actors"][0]["actor"], "newest")
         self.assertNotEqual(original["source_cache"]["fingerprint"], after["source_cache"]["fingerprint"])
         same = self.store.assemble_window(start, end, self.root / "same")
         self.assertEqual(after["source_cache"]["fingerprint"], same["source_cache"]["fingerprint"])
@@ -171,6 +178,29 @@ class CacheFixture(unittest.TestCase):
         changed = CacheStore(self.root / "cache", ACCOUNT, {**SCOPE, "interval_minutes": 60})
         self.assertNotEqual(changed.directory, self.store.directory)
         changed.close()
+
+    def test_stale_identity_index_is_reclaimed_without_deleting_archives(self):
+        target = self.store.directory / "segments/one/attempt-stopped"
+        target.mkdir(parents=True)
+        stale = target / ".summary-identities-abc123.sqlite3"
+        preserved = target / "operation-summary.json"
+        stale.write_bytes(b"hash-only temporary data")
+        preserved.write_bytes(b"historical summary")
+        self.store.run_due(NOW, snapshot, max_buckets=1, lookback_hours=1)
+        self.assertFalse(stale.exists())
+        self.assertEqual(preserved.read_bytes(), b"historical summary")
+
+    def test_changed_summary_is_missing_coverage_and_queued_for_repair(self):
+        self.store.run_due(NOW, snapshot, max_buckets=1, lookback_hours=1)
+        start, end = datetime(2026, 10, 29, 8, 30, tzinfo=UTC), datetime(2026, 10, 29, 9, tzinfo=UTC)
+        active = self.store.directory / self.store.bucket(start)["active_path"]
+        data = json.loads((active / "operation-summary.json").read_text(encoding="utf-8"))
+        data["actors"][0]["total"] += 1
+        (active / "operation-summary.json").write_text(json.dumps(data), encoding="utf-8")
+        report = self.store.assemble_window(start, end, self.root / "tampered")
+        self.assertEqual(report["collection_status"], "partial")
+        self.assertEqual(len(report["source_cache"]["missing_segments"]), 1)
+        self.assertEqual(self.store.bucket(start)["status"], "failed")
 
     def test_overlapping_invocation_does_not_collect_twice(self):
         with _exclusive(self.store.directory / ".collect.lock") as locked:

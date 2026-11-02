@@ -330,178 +330,83 @@ def _json_lines(path, errors):
 
 
 def build_daily_report(directory: Path, *, audit_date: str, start: datetime, end: datetime, offline=False, period_kind="daily") -> dict:
+    """Build per-user totals from a compact snapshot or stream a legacy archive."""
+    from rds_summary import merge_summaries, summarize_archive
+
     if period_kind not in {"daily", "custom"}:
         raise ValueError("period_kind must be daily or custom")
     directory = Path(directory)
     start, end = timestamp(start), timestamp(end)
     if start >= end:
         raise ValueError("report window start must precede end")
-    # Never interpolate an arbitrary supplied date into an output pathname.
     datetime.strptime(audit_date, "%Y-%m-%d")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", audit_date):
         raise ValueError("audit_date must be YYYY-MM-DD")
     collection = json.loads((directory / "report.json").read_text(encoding="utf-8-sig"))
-    errors = [redact(check) for check in collection.get("checks", []) if check.get("status") == "error"]
-    events, unparsed, seen_management, seen_sql = [], [], set(), set()
-    seen_unknown = set()
-    filtered_management = filtered_queries = filtered_auxiliary = unclassified = 0
-
-    def preserve_unknown(evidence, envelope, index):
-        event_id = str(envelope.get("eventId") or "")
-        reason = evidence.get("reason", "parse_error")
-        if event_id:
-            key = (str(envelope.get("region") or ""), str(envelope.get("logGroupName") or ""), str(envelope.get("logStreamName") or ""), event_id, index, reason)
-            if key in seen_unknown:
-                return False
-            seen_unknown.add(key)
-        evidence.update(event_id=event_id, record_index=index, reason=reason)
-        unparsed.append(evidence)
-        errors.append({key: value for key, value in evidence.items() if key != "raw"})
-        return True
-    for line_number, envelope in _json_lines(directory / "management-events.jsonl", errors):
-        try:
-            row = normalize_management(envelope)
-            if not start <= timestamp(row["time_utc"]) < end or row["event_id"] in seen_management:
-                continue
-            seen_management.add(row["event_id"])
-            if row["category"] not in CHANGE_CATEGORIES:
-                filtered_management += 1
-                continue
-            events.append(row)
-        except (ValueError, TypeError, KeyError, OverflowError) as exc:
-            errors.append({"scope": "parse_management", "line": line_number, "message": str(exc)})
-    general_count, audit_envelopes, sql_duplicates = 0, 0, 0
-    for path in sorted((directory / "cloudwatch").glob("*.jsonl")):
-        for line_number, envelope in _json_lines(path, errors):
-            group = str(envelope.get("logGroupName") or "")
-            if group.endswith("/general"):
-                general_count += 1
-                continue
-            if not group.endswith("/audit"):
-                continue
-            # eventId is unique only within a log stream; SQL text isn't a dedup key.
-            event_id = str(envelope.get("eventId") or "")
-            if not event_id:
-                errors.append({"scope": "parse_sql", "file": path.name, "line": line_number, "message": "CloudWatch audit event has no eventId; no safe dedup key"})
-            else:
-                dedup = (str(envelope.get("region") or ""), group, str(envelope.get("logStreamName") or ""), event_id)
-                if dedup in seen_sql:
-                    sql_duplicates += 1
-                    continue
-                seen_sql.add(dedup)
-            audit_envelopes += 1
-            message = str(envelope.get("message") or "")
-            segments = split_audit_message(message)
-            try:
-                indexes = audit_record_indexes(envelope, len(segments))
-            except ValueError as exc:
-                preserve_unknown({"scope": "parse_sql", "file": path.name, "line": line_number, "message": str(exc), "log_group": group, "log_stream": str(envelope.get("logStreamName") or ""), "raw": redact_text(message)}, envelope, None)
-                continue
-            for index, segment in zip(indexes, segments):
-                try:
-                    row = parse_audit_record(segment, envelope, index)
-                    if not start <= timestamp(row["time_utc"]) < end:
-                        continue
-                    disposition = row_disposition(row)
-                    if disposition == "change":
-                        events.append(row)
-                    elif disposition == "read":
-                        filtered_queries += 1
-                    elif disposition == "auxiliary":
-                        filtered_auxiliary += 1
-                    else:
-                        evidence = {"scope": "classify_sql", "reason": "unclassified_sql", "file": path.name, "line": line_number, "record_index": index, "message": "SQL cannot be reliably classified as create/delete/modify; preserved separately", "log_group": group, "log_stream": str(envelope.get("logStreamName") or ""), "raw": redact_text(segment)}
-                        unclassified += preserve_unknown(evidence, envelope, index)
-                except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation) as exc:
-                    evidence = {"scope": "parse_sql", "file": path.name, "line": line_number, "record_index": index, "message": str(exc), "log_group": group, "log_stream": str(envelope.get("logStreamName") or ""), "raw": redact_text(segment)}
-                    preserve_unknown(evidence, envelope, index)
-    quarantine_path = directory / "quarantine" / "sql-unclassified.jsonl"
-    if quarantine_path.is_file():
-        for line_number, envelope in _json_lines(quarantine_path, errors):
-            try:
-                occurred = datetime.fromtimestamp(int(envelope["timestamp"]) / 1000, UTC)
-                if not start <= occurred < end:
-                    continue
-            except (ValueError, TypeError, KeyError, OverflowError):
-                pass  # Preserve malformed evidence rather than guessing it is outside the window.
-            evidence = {
-                "scope": "quarantine_sql", "reason": envelope.get("reason", "parse_error"),
-                "file": str(quarantine_path.relative_to(directory)), "line": line_number,
-                "message": str(envelope.get("message") or "Uncertain SQL preserved during collection"),
-                "log_group": str(envelope.get("logGroupName") or ""), "log_stream": str(envelope.get("logStreamName") or ""),
-                "raw": redact_text(str(envelope.get("raw") or "")),
-            }
-            if preserve_unknown(evidence, envelope, envelope.get("record_index")) and evidence["reason"] == "unclassified_sql":
-                unclassified += 1
-    for region in collection.get("regions", {}).values():
-        filtered_management += int(region.get("filtered_management_event_count") or 0)
-        for group in region.get("sql_log_groups", []):
-            download = group.get("download") or {}
-            filtered_queries += int(download.get("filtered_read_record_count") or 0)
-            filtered_auxiliary += int(download.get("filtered_auxiliary_record_count") or 0)
-    events.sort(key=lambda row: (row["time_utc"], row["source_kind"], row["event_id"]))
-    counts = dict.fromkeys(CATEGORIES, 0)
-    attempted = dict.fromkeys(CATEGORIES, 0)
-    by_source = {kind: {"label": label, "total": 0, "failed": 0, "counted_total": 0, "counts": dict.fromkeys(CATEGORIES, 0), "attempted_counts": dict.fromkeys(CATEGORIES, 0)} for kind, label in SOURCE_LABELS.items()}
-    actor_rows = {}
-    actor_contexts = defaultdict(dict)
-    for row in events:
-        source = by_source[row["source_kind"]]
-        source["total"] += 1
-        source["failed"] += row["status"] == "failed"
-        attempted[row["category"]] += 1
-        source["attempted_counts"][row["category"]] += 1
-        key = "sql:username:" + row["actor"] if row["source_kind"] == "sql" else row["actor_key"]
-        row["actor_group_key"] = key
-        actor_row = actor_rows.setdefault(key, {"actor": row["actor"], "actor_key": key, "actor_type": row["actor_type"], "source_kind": row["source_kind"], "total": 0, "failed": 0, "counts": dict.fromkeys(CATEGORIES, 0), "anchor": "actor-" + hashlib.sha256(key.encode()).hexdigest()[:16]})
-        context = {name: row.get(name) for name in ("actor_key", "region", "serverhost", "database", "log_group", "log_stream") if row.get(name)}
-        context_key = (row["actor_key"], row.get("region", ""), row.get("database", ""))
-        actor_contexts[key].setdefault(context_key, context)
-        actor_row["total"] += 1
-        actor_row["failed"] += row["status"] == "failed"
-        if row["counted"]:
-            counts[row["category"]] += 1
-            source["counts"][row["category"]] += 1
-            source["counted_total"] += 1
-            actor_row["counts"][row["category"]] += 1
-    for key, actor_row in actor_rows.items():
-        actor_row["contexts"] = [actor_contexts[key][context] for context in sorted(actor_contexts[key])]
+    path = directory / "operation-summary.json"
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        if timestamp(payload["window"]["start_inclusive"]) != start or timestamp(payload["window"]["end_exclusive"]) != end:
+            raise ValueError("operation summary window does not match requested report window")
+        summary = merge_summaries([payload], start, end)
+    else:
+        summary = summarize_archive(directory, start, end)
+        for region in collection.get("regions", {}).values():
+            summary["coverage"]["filtered_management"] += int(region.get("filtered_management_event_count") or 0)
+            for group in region.get("sql_log_groups", []):
+                download = group.get("download") or {}
+                summary["coverage"]["filtered_queries"] += int(download.get("filtered_read_record_count") or 0)
+                summary["coverage"]["filtered_auxiliary"] += int(download.get("filtered_auxiliary_record_count") or 0)
+    # Free-form upstream error messages can contain SQL or API parameters. Keep
+    # only fixed classifications and counters in the exported summary report.
+    errors = [{"scope": "collection", "reason": "collection_error", "count": 1}
+              for check in collection.get("checks", []) if check.get("status") == "error"]
+    errors += summary.get("errors", [])
+    counts, attempted = dict.fromkeys(CATEGORIES, 0), dict.fromkeys(CATEGORIES, 0)
+    by_source = {kind: {"label": label, "total": 0, "failed": 0, "counted_total": 0,
+                       "counts": dict.fromkeys(CATEGORIES, 0), "attempted_counts": dict.fromkeys(CATEGORIES, 0)}
+                 for kind, label in SOURCE_LABELS.items()}
+    actors = summary["actors"]
+    for actor in actors:
+        actor["anchor"] = "actor-" + hashlib.sha256(actor["actor_key"].encode()).hexdigest()[:16]
+        source = by_source[actor["source_kind"]]
+        source["total"] += actor["total"]
+        source["failed"] += actor["failed"]
+        for category in CATEGORIES:
+            counts[category] += actor["counts"][category]
+            attempted[category] += actor["attempted_counts"][category]
+            source["counts"][category] += actor["counts"][category]
+            source["attempted_counts"][category] += actor["attempted_counts"][category]
+        source["counted_total"] += sum(actor["counts"].values())
     notes = [
-        "新增、删除、修改统计的是日志中未报错的 API 请求或 SQL 语句条数，不是受影响行数。失败请求保留在明细和失败数量中，不计入成功返回的增删改。",
-        "API 未报错不保证异步变更最终完成；SQL 返回码 0 不证明事务最终 COMMIT。两种来源分别汇总，共用数据库账号不能推定真实人员。",
-        "同名数据库账号跨实例、日志流合并汇总，具体实例信息保留在明细；账号名称区分大小写，AWS 身份与数据库账号分别统计。",
-        "主报告仅保留可识别的新增、删除、修改；只读管理 API、SELECT 等查询、连接及 TABLE 辅助记录不进入明细。general 日志不参与增删改统计，避免与 audit 重复计数。",
-        "复杂 WITH、CALL、PREPARE、EXECUTE、包含内部分号的语句及无法解析的记录独立保留为待核查证据，不冒充只读，也不计入增删改数量。",
-        "无日志不等于无 SQL 操作：审计可能未启用、被用户/事件过滤、延迟、截断或超过保留期。当前配置不能证明历史覆盖完整。",
-        "MySQL 无时区的日志原时间不用于猜测时区，报告使用 CloudWatch 事件时间；原时间保留。Aurora Unix 时间戳按 UTC 转换。",
-        "SQL 正文可能包含业务数据。已对常见凭据字段和口令语句脱敏，无法保证识别全部业务敏感值；请限制报告访问。",
+        "新增、删除、修改按未报错的 API 请求或审计语句条数统计，不是受影响行数；失败请求仅计入失败数量。",
+        "SQL 返回码 0 不证明事务最终提交，API 未报错不保证异步资源变更最终完成。",
+        "同名数据库账号跨实例合并汇总，账号名称区分大小写；AWS 身份与数据库账号分别统计，共用账号不能确定真实人员。",
+        "只汇总可识别的增删改；无法识别、格式异常或缺少事件身份的记录只保留问题数量，报告标记不完整。",
+        "无日志不等于无操作：审计可能未启用、被用户或事件过滤、延迟、截断或超过保留期。",
+        "数据库审计按 CloudWatch 事件时间归属窗口，同条事件内的记录一起汇总；管理 API 使用自身事件时间。",
     ]
     if period_kind == "daily":
-        notes.append("相邻日报的前一日 07:00 至当日 08:00 窗口有意重叠 1 小时，跨日报数量不可直接相加。")
-    else:
-        notes.append("本报告使用所示的自定义时间窗口，不套用固定日报窗口；所有明细按该窗口左闭右开筛选。")
+        notes.append("相邻日报窗口有意重叠 1 小时，跨日报数量不可直接相加。")
     if not collection.get("sql_log_download_requested"):
-        notes.append("本次未请求下载 CloudWatch SQL 日志，数据库内部增删改未建立采集覆盖。")
-    if not audit_envelopes:
+        notes.append("本次未请求读取 CloudWatch SQL 日志，数据库内部增删改未建立采集覆盖。")
+    if not summary["coverage"].get("audit_cloudwatch_events"):
         notes.append("本次没有可解析的 CloudWatch audit 事件输入；不能据此认定数据库内部没有增删改。")
+    coverage = {**summary["coverage"], "notes": notes, "collection_status": collection.get("collection_status", "unknown")}
     return {
         "metadata": {
             "audit_date": audit_date, "account_id": str(collection.get("identity", {}).get("Account") or "unknown"),
             "generated_at": iso(datetime.now(UTC)), "window_start_utc": iso(start), "window_end_utc_exclusive": iso(end),
             "period_kind": period_kind, "period_label": "北京时间日报" if period_kind == "daily" else "自定义时间窗口",
-            "timezone": "Asia/Shanghai", "complete": collection.get("collection_status") == "ok" and not errors,
-            "report_type": "rds", "source_counts": {key: value["counts"] for key, value in by_source.items()},
-            "errors": errors, "offline": bool(offline), "example_data": bool(collection.get("example_data", False)), "counts": counts, "attempted_counts": attempted,
-            "total": len(events), "counted_total": sum(counts.values()), "failed_or_partial": sum(row["status"] == "failed" for row in events),
-            "historical_sql_completeness": "not_established",
-            "source_cache": collection.get("source_cache"),
-            "change_only": True,
-            "report_filename": f"{audit_date}-rds操作审计{'-自定义窗口' if period_kind == 'custom' else ''}.html",
+            "timezone": "Asia/Shanghai", "complete": collection.get("collection_status") == "ok" and summary.get("complete") is True and not errors,
+            "report_type": "rds", "summary_only": True, "source_counts": {key: value["counts"] for key, value in by_source.items()},
+            "errors": errors, "offline": bool(offline), "example_data": bool(collection.get("example_data", False)),
+            "counts": counts, "attempted_counts": attempted, "total": sum(actor["total"] for actor in actors),
+            "counted_total": sum(counts.values()), "failed_or_partial": sum(actor["failed"] for actor in actors),
+            "historical_sql_completeness": "not_established", "source_cache": collection.get("source_cache"),
+            "change_only": True, "report_filename": f"{audit_date}-rds操作审计{'-自定义窗口' if period_kind == 'custom' else ''}.html",
         },
-        "events": events, "by_source": by_source,
-        "actors": sorted(actor_rows.values(), key=lambda item: (-item["total"], item["actor_key"])),
-        "coverage": {"notes": notes, "audit_cloudwatch_events": audit_envelopes, "general_log_events_not_counted": general_count, "duplicate_cloudwatch_events": sql_duplicates, "unparsed_records": len(unparsed), "collection_status": collection.get("collection_status", "unknown"), "filtered_management": filtered_management, "filtered_queries": filtered_queries, "filtered_auxiliary": filtered_auxiliary, "unclassified": unclassified},
-        "unparsed": unparsed,
+        "events": [], "unparsed": [], "by_source": by_source, "actors": actors, "coverage": coverage,
     }
 
 

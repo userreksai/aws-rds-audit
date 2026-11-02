@@ -37,14 +37,16 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("write_units(Path('/etc/systemd/system'), root", script)
         self.assertNotIn("'@PROJECT_ROOT@': quote(root)", script)
 
-    def test_installer_keeps_existing_sql_alert_settings_and_validates_before_writing(self):
+    def test_installer_migrates_old_sql_alert_switch_to_summary_only(self):
         script = (Path(__file__).parent / "install.sh").read_text(encoding="utf-8")
-        self.assertIn("rds_sql_alerts.py", script)
-        self.assertIn("'AWS_RDS_SQL_ALERTS': '1'", script)
-        self.assertIn("'AWS_RDS_SQL_ALERT_COMMANDS': 'DELETE,UPDATE,DROP,TRUNCATE,ALTER'", script)
+        self.assertIn("rds_summary.py", script)
+        self.assertIn("from run_collect import summary_environment_updates", script)
+        self.assertIn("**summary_environment_updates()", script)
         self.assertIn("if key not in existing:", script)
-        self.assertLess(script.index("sql_alert_settings({**existing, **updates})"), script.index("os.replace(temporary, env_path)"))
+        self.assertLess(script.index("**summary_environment_updates()"), script.index("os.replace(temporary, env_path)"))
+        self.assertNotIn("if sql_alerts: updates['AWS_RDS_SQL_ALERTS']", script)
         self.assertIn("--no-sql-alerts", script)
+        self.assertIn("当前仅汇总模式不提供逐条 SQL 告警", script)
 
     def test_collection_units_keep_scalar_directory_and_quoted_execution_paths(self):
         service, timer = render_collection_units("/usr/local/aws-rds-shenji", "root", "root", "/root")

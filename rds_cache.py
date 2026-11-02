@@ -304,13 +304,21 @@ class CacheStore:
                 raise ValueError("Partial transport/permission/file collection cannot become a successful checkpoint")
         if errors and not (quality_partial and all(row.get("error_type") == "UnclassifiedSqlRecords" for row in errors)):
             raise ValueError("Snapshot contains unapproved collection errors")
-        if not (Path(path) / "management-events.jsonl").is_file():
+        summary_path = Path(path) / "operation-summary.json"
+        if source.get("summary_only"):
+            from rds_summary import validate_summary
+            if not summary_path.is_file():
+                raise ValueError("Summary snapshot is missing operation-summary.json")
+            validate_summary(json.loads(summary_path.read_text(encoding="utf-8-sig")),
+                             datetime.fromtimestamp(start, UTC), datetime.fromtimestamp(end, UTC))
+        elif not (Path(path) / "management-events.jsonl").is_file():
             raise ValueError("Snapshot is missing management-events.jsonl")
         digest = hashlib.sha256()
         digest.update(_canonical({"account_id": self.account_id, "start": start, "end": end, "errors": errors}).encode())
-        files = [Path(path) / name for name in ("management-events.jsonl", "rds-events.jsonl")]
-        files += sorted((Path(path) / "cloudwatch").glob("*.jsonl"))
-        files += sorted((Path(path) / "quarantine").glob("*.jsonl"))
+        files = [summary_path] if source.get("summary_only") else [Path(path) / name for name in ("management-events.jsonl", "rds-events.jsonl")]
+        if not source.get("summary_only"):
+            files += sorted((Path(path) / "cloudwatch").glob("*.jsonl"))
+            files += sorted((Path(path) / "quarantine").glob("*.jsonl"))
         for file in files:
             if not file.exists():
                 continue
@@ -332,6 +340,13 @@ class CacheStore:
             if not acquired:
                 stats["busy"] = True
                 return stats
+            # A killed collector cannot close its disposable identity index. The
+            # process lock establishes that these attempt-local files are stale.
+            for candidate in self.directory.glob("segments/*/attempt-*/.summary-identities-*.sqlite3"):
+                if (re.fullmatch(r"\.summary-identities-[-a-z0-9_]+\.sqlite3", candidate.name)
+                        and not candidate.is_symlink() and candidate.is_file()
+                        and candidate.resolve().is_relative_to(self.directory)):
+                    candidate.unlink()
             # The OS lock proves no previous collector process still owns a running row.
             self.connection.execute("UPDATE buckets SET status='failed',next_retry=?,last_error='Previous collection process stopped before checkpoint commit' WHERE status='running'", (stamp,))
             latest_end = (stamp - publish_delay_minutes * 60) // self.interval_seconds * self.interval_seconds
@@ -445,64 +460,49 @@ class CacheStore:
         if (destination / "report.json").exists() or (destination / "management-events.jsonl").exists():
             raise FileExistsError("Use a new destination for each cache assembly")
         checks, selected, missing, filtering_regions, versions = [], [], [], {}, []
-        streams = {}
-        try:
-            streams["management-events.jsonl"] = (destination / "management-events.jsonl").open("x", encoding="utf-8", newline="\n")
-            streams["rds-events.jsonl"] = (destination / "rds-events.jsonl").open("x", encoding="utf-8", newline="\n")
-            for stamp in range(first, last, self.interval_seconds):
-                row = self.connection.execute("SELECT * FROM buckets WHERE start=?", (stamp,)).fetchone()
-                row = dict(row) if row else None
-                if row is None or not row["active_path"]:
-                    state = row["status"] if row else "missing"
-                    detail = {"start": _iso(stamp), "end": _iso(stamp + self.interval_seconds), "status": state, "error": row["last_error"] if row else "Segment has not been collected"}
-                    missing.append(detail)
-                    checks.append({"scope": "cache_segment", "status": "error", "error_type": "MissingCacheSegment", "message": _canonical(detail)})
-                    versions.append({"start": stamp, "status": state, "digest": None})
-                    continue
-                path = self._snapshot_path(row["active_path"])
-                try:
-                    source, actual_digest = self._validate_snapshot(path, stamp, stamp + self.interval_seconds, True)
-                    if actual_digest != row["active_digest"]:
-                        raise ValueError("Committed snapshot contents changed after checkpoint")
-                except Exception as exc:
-                    self.connection.execute("UPDATE buckets SET status='failed',next_retry=0,last_error=? WHERE start=?", (_safe_error(exc), stamp))
-                    self.connection.commit()
-                    detail = {"start": _iso(stamp), "end": _iso(stamp + self.interval_seconds), "status": "corrupt", "error": _safe_error(exc)}
-                    missing.append(detail)
-                    checks.append({"scope": "cache_segment", "status": "error", "error_type": "InvalidCacheSnapshot", "message": _canonical(detail)})
-                    versions.append({"start": stamp, "status": "corrupt", "digest": None})
-                    continue
-                if row["status"] != "succeeded":
-                    checks.append({"scope": "cache_refresh", "status": "error", "error_type": "CacheRefreshFailed", "message": f"{_iso(stamp)} latest collection/refresh status is {row['status']}; using its last successful snapshot"})
-                selected.append({"start": _iso(stamp), "end": _iso(stamp + self.interval_seconds), "digest": actual_digest})
-                versions.append({"start": stamp, "status": row["status"], "digest": actual_digest})
-                checks.extend(check for check in source.get("checks", []) if check.get("status") == "error")
-                for region_name, data in source.get("regions", {}).items():
-                    region = filtering_regions.setdefault(region_name, {"filtered_management_event_count": 0, "sql_log_groups": []})
-                    region["filtered_management_event_count"] += int(data.get("filtered_management_event_count") or 0)
-                    region["sql_log_groups"].extend(data.get("sql_log_groups", []))
-                files = [path / name for name in ("management-events.jsonl", "rds-events.jsonl")]
-                files += sorted((path / "cloudwatch").glob("*.jsonl"))
-                files += sorted((path / "quarantine").glob("*.jsonl"))
-                for file in files:
-                    if not file.exists():
-                        continue
-                    relative = file.relative_to(path).as_posix()
-                    # A shared group filename across segments intentionally appends to one file.
-                    if relative not in streams:
-                        target = destination / relative
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        streams[relative] = target.open("x", encoding="utf-8", newline="\n")
-                    with file.open(encoding="utf-8-sig") as original:
-                        for line in original:
-                            if line.strip():
-                                streams[relative].write(line.rstrip("\r\n") + "\n")
-        finally:
-            for handle in streams.values():
-                handle.close()
+        from rds_summary import merge_summaries, save_summary, summarize_directory
+        summaries = []
+        for stamp in range(first, last, self.interval_seconds):
+            row = self.connection.execute("SELECT * FROM buckets WHERE start=?", (stamp,)).fetchone()
+            row = dict(row) if row else None
+            if row is None or not row["active_path"]:
+                state = row["status"] if row else "missing"
+                detail = {"start": _iso(stamp), "end": _iso(stamp + self.interval_seconds), "status": state, "error": row["last_error"] if row else "Segment has not been collected"}
+                missing.append(detail)
+                checks.append({"scope": "cache_segment", "status": "error", "error_type": "MissingCacheSegment", "message": _canonical(detail)})
+                versions.append({"start": stamp, "status": state, "digest": None})
+                continue
+            path = self._snapshot_path(row["active_path"])
+            try:
+                source, actual_digest = self._validate_snapshot(path, stamp, stamp + self.interval_seconds, True)
+                if actual_digest != row["active_digest"]:
+                    raise ValueError("Committed snapshot contents changed after checkpoint")
+            except Exception as exc:
+                self.connection.execute("UPDATE buckets SET status='failed',next_retry=0,last_error=? WHERE start=?", (_safe_error(exc), stamp))
+                self.connection.commit()
+                detail = {"start": _iso(stamp), "end": _iso(stamp + self.interval_seconds), "status": "corrupt", "error": _safe_error(exc)}
+                missing.append(detail)
+                checks.append({"scope": "cache_segment", "status": "error", "error_type": "InvalidCacheSnapshot", "message": _canonical(detail)})
+                versions.append({"start": stamp, "status": "corrupt", "digest": None})
+                continue
+            if row["status"] != "succeeded":
+                checks.append({"scope": "cache_refresh", "status": "error", "error_type": "CacheRefreshFailed", "message": f"{_iso(stamp)} latest collection/refresh status is {row['status']}; using its last successful snapshot"})
+            selected.append({"start": _iso(stamp), "end": _iso(stamp + self.interval_seconds), "digest": actual_digest})
+            versions.append({"start": stamp, "status": row["status"], "digest": actual_digest})
+            checks.extend(check for check in source.get("checks", []) if check.get("status") == "error")
+            for region_name, data in source.get("regions", {}).items():
+                region = filtering_regions.setdefault(region_name, {"filtered_management_event_count": 0, "sql_log_groups": []})
+                region["filtered_management_event_count"] += int(data.get("filtered_management_event_count") or 0)
+                region["sql_log_groups"].extend(data.get("sql_log_groups", []))
+            summaries.append(summarize_directory(path, datetime.fromtimestamp(stamp, UTC),
+                                                 datetime.fromtimestamp(stamp + self.interval_seconds, UTC)))
         fingerprint = hashlib.sha256(_canonical({"account": self.account_id, "scope": self.scope, "start": first, "end": last, "versions": versions}).encode()).hexdigest()
+        combined = merge_summaries(summaries, start, end)
+        if checks:
+            combined["complete"] = False
+        save_summary(combined, destination)
         report = {
-            "schema_version": 1, "identity": {"Account": self.account_id},
+            "schema_version": 1, "summary_only": True, "identity": {"Account": self.account_id},
             "window": {"start_inclusive": _iso(first), "end_exclusive": _iso(last)},
             "period_kind": "daily", "operation_scope": "changes_only", "sql_log_download_requested": True,
             "collection_status": "partial" if checks else "ok", "failed_check_count": len(checks),

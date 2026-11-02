@@ -14,9 +14,7 @@ usage() {
   --publish-dir PATH    完整网页发布目录；默认项目下 index/，首页为 index.html
   --minute 05|10        北京时间执行分钟；新安装默认 10（08:10）
   --interval-minutes 30|60  增量分段分钟数；默认30，采集器每5分钟检查到期段和失败重试
-  --sql-alerts          启用 SQL 删除/更新等变更即时告警；新安装默认启用
-  --no-sql-alerts       关闭 SQL 变更即时告警，仍保留采集异常及日报通知
-  --sql-alert-commands COMMANDS  逗号分隔 DELETE,UPDATE,DROP,TRUNCATE,ALTER；默认全部五种
+  --no-sql-alerts       兼容旧参数；仅汇总模式始终关闭逐条 SQL 告警
   --no-enable           安装并预检，但不启用定时器
   --check-only          只检查已部署环境和配置，不安装软件、不写文件、不启停服务
   --help                显示帮助
@@ -59,7 +57,7 @@ while (($#)); do
       esac
       shift 2 ;;
     --no-enable) NO_ENABLE=1; shift ;;
-    --sql-alerts) SQL_ALERTS=1; shift ;;
+    --sql-alerts) fail '当前仅汇总模式不提供逐条 SQL 告警，请移除 --sql-alerts。' ;;
     --no-sql-alerts) SQL_ALERTS=0; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -79,7 +77,7 @@ if ((EUID != 0)); then
   exec sudo -- bash "$PROJECT_ROOT/install.sh" "${ORIGINAL_ARGS[@]}"
 fi
 [[ "$PROJECT_ROOT" != *$'\n'* && "$PROJECT_ROOT" != *$'\r'* ]] || fail '项目路径不能包含换行。'
-for name in rds_audit.py rds_report.py rds_change_filter.py rds_report_pages.py rds_cache.py rds_jobs.py rds_sql_alerts.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/run_collect.py deploy/run_failure.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer deploy/aws-rds-audit-collect.service deploy/aws-rds-audit-collect.timer deploy/aws-rds-audit-failure@.service; do
+for name in rds_audit.py rds_report.py rds_summary.py rds_change_filter.py rds_report_pages.py rds_cache.py rds_jobs.py lark_notify.py lark-config.example.json requirements.txt deploy/run_daily.py deploy/run_collect.py deploy/run_failure.py deploy/render_units.py deploy/aws-rds-audit.service deploy/aws-rds-audit.timer deploy/aws-rds-audit-collect.service deploy/aws-rds-audit-collect.timer deploy/aws-rds-audit-failure@.service; do
   [[ -f "$PROJECT_ROOT/$name" ]] || fail "项目缺少文件：$name，请先下载完整项目。"
 done
 ENV_FILE=/etc/aws-rds-audit.env
@@ -193,16 +191,15 @@ root, destination, username, group, profile_set, profile, regions_set, regions, 
 sys.path.insert(0, str(Path(root) / 'deploy'))
 from run_daily import load_environment
 from render_units import write_units
-from run_collect import sql_alert_settings
+from run_collect import summary_environment_updates
 env_path = Path(destination)
 existing = load_environment(env_path) if env_path.exists() else {}
-updates = {'AWS_RDS_RUN_USER': username}
+updates = {'AWS_RDS_RUN_USER': username, **summary_environment_updates()}
 defaults = {
     'AWS_RDS_REGIONS': 'all', 'AWS_RDS_REPORT_ROOT': str(Path(root) / 'reports'),
     'AWS_RDS_LARK_CONFIG': str(Path(root) / 'lark-config.json'), 'AWS_RDS_MINUTE': '10',
     'AWS_RDS_CACHE_DIR': str(Path(root) / 'cache'), 'AWS_RDS_INTERVAL_MINUTES': '30',
     'AWS_RDS_CACHE_LOOKBACK_HOURS': '26', 'AWS_RDS_MAX_BUCKETS_PER_RUN': '6',
-    'AWS_RDS_SQL_ALERTS': '1', 'AWS_RDS_SQL_ALERT_COMMANDS': 'DELETE,UPDATE,DROP,TRUNCATE,ALTER',
     'AWS_RDS_PUBLISH_DIR': str(Path(root) / 'index'),
 }
 for key, value in defaults.items():
@@ -215,9 +212,7 @@ if regions_set == '1': updates['AWS_RDS_REGIONS'] = regions
 if publish_set == '1': updates['AWS_RDS_PUBLISH_DIR'] = publish
 if minute: updates['AWS_RDS_MINUTE'] = minute
 if interval: updates['AWS_RDS_INTERVAL_MINUTES'] = interval
-if sql_alerts: updates['AWS_RDS_SQL_ALERTS'] = sql_alerts
-if sql_commands: updates['AWS_RDS_SQL_ALERT_COMMANDS'] = sql_commands
-sql_alert_settings({**existing, **updates})
+# Legacy command selections no longer affect summary collection or notifications.
 content = env_path.read_text(encoding='utf-8-sig') if env_path.exists() else '# RDS audit service environment; single-line KEY="value" settings. Never source this file in a shell.\n'
 lines = [line for line in content.splitlines() if line.partition('=')[0].strip() not in updates]
 lines += [key + '=' + json.dumps(value, ensure_ascii=False) for key, value in updates.items()]
