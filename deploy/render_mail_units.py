@@ -48,8 +48,12 @@ def render_units(project_root, username, group, home, config_path):
         ("aws-rds-audit", "--scheduled", "AWS RDS multi-account PDF email schedule"),
         ("aws-rds-audit-collect", "--collect", "AWS RDS multi-account source-IP interval collection"),
     ):
+        # Systemd rejects quotes and other special characters in the executable
+        # path even after valid word unquoting. Keep its executable fixed and
+        # let env exec the absolute interpreter as an ordinary argv value.
+        # No shell participates, so quoted project/config paths remain literal.
         command = " ".join(quote_word(item, executable_argument=True)
-                           for item in (python, runner, "--config", config_path, mode))
+                           for item in ("/usr/bin/env", "--", python, runner, "--config", config_path, mode))
         rendered[name + ".service"] = f"""[Unit]
 Description={description}
 Wants=network-online.target

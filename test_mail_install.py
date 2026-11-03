@@ -18,6 +18,7 @@ class MailUnitTests(unittest.TestCase):
         self.assertEqual(set(units), set(UNIT_NAMES))
         for name, content in units.items():
             if name.endswith(".service"):
+                self.assertIn('ExecStart="/usr/bin/env" "--" "/usr/local/aws-rds-shenji/.venv/bin/python"', content)
                 self.assertIn('"/usr/local/aws-rds-shenji/rds_multi.py" "--config" "/etc/rds-audit/config.json"', content)
                 self.assertIn("\nWorkingDirectory=/\n", content)
                 self.assertIn("\nUMask=0077\n", content)
@@ -37,10 +38,14 @@ class MailUnitTests(unittest.TestCase):
         config = '/etc/RDS 审计/config "quoted" %n ${TOKEN}.json'
         units = render_units('/opt/RDS "审计" %n', "audit", "audit", '/home/audit "name" %n', config)
         service = units["aws-rds-audit.service"]
+        self.assertIn('ExecStart="/usr/bin/env" "--" "/opt/RDS \\"审计\\" %%n/.venv/bin/python"', service)
         self.assertIn('"/opt/RDS \\"审计\\" %%n/.venv/bin/python"', service)
         self.assertIn('"/etc/RDS 审计/config \\"quoted\\" %%n $${TOKEN}.json"', service)
         self.assertIn('Environment="HOME=/home/audit \\"name\\" %%n"', service)
         self.assertNotIn("WorkingDirectory=/opt", service)
+        self.assertNotIn('ExecStart="/opt/', service)
+        self.assertNotIn('/bin/sh', service)
+        self.assertNotIn('/bin/bash', service)
         self.assertEqual(quote_word(r'/etc/a\b "c" %n $x', executable_argument=True),
                          '"/etc/a\\\\b \\"c\\" %%n $$x"')
 

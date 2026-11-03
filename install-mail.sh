@@ -120,7 +120,6 @@ if ((CHECK_ONLY == 0)); then
   chown "$RUN_USER:$RUN_GROUP" "$CONFIG_PATH"
   chmod 0600 "$CONFIG_PATH"
   chown "$RUN_USER:$RUN_GROUP" "$PROJECT_ROOT"
-  chmod 0700 "$PROJECT_ROOT"
 fi
 log '检查 JSON、SMTP 填写完整性和 AWS 身份/日志读取权限（不发送邮件）。'
 run_as_user "$VENV/bin/python" "$PROJECT_ROOT/rds_multi.py" --config "$CONFIG_PATH" --check-config || fail '配置预检失败，请填写配置后重试。'
