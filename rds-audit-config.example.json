@@ -1,0 +1,44 @@
+{
+  "OUTPUT_DIRECTORY": "output",
+  "COLLECTION_INTERVAL_MINUTES": 30,
+  "RETENTION_DAYS": 7,
+  "TIMEZONE": "Asia/Shanghai",
+  "DAILY_MAIL_TIME": "08:10",
+  "MAIL_REPORT_MODE": "previous_day",
+  "MAX_BUCKETS_PER_ACCOUNT_PER_RUN": 6,
+  "LOG_DELAY_MINUTES": 5,
+  "REFRESH_DELAY_MINUTES": 60,
+  "PDF_FONT_PATH": "",
+  "SMTP_HOST": "",
+  "SMTP_PORT": 465,
+  "SMTP_USERNAME": "",
+  "SMTP_AUTH_CODE": "",
+  "SMTP_SECURITY": "ssl",
+  "SMTP_TIMEOUT": 30,
+  "MAIL_RECIPIENTS": [],
+  "MAIL_CC": [],
+  "MAIL_SUBJECT": "AW-RDS审计报告",
+  "MAIL_SENDER_NAME": "",
+  "ACCOUNTS": [
+    {
+      "NAME": "account-a",
+      "ACCOUNT_ID": "000000000001",
+      "ENABLED": true,
+      "AWS_ACCESS_KEY_ID": "",
+      "AWS_SECRET_ACCESS_KEY": "",
+      "AWS_SESSION_TOKEN": "",
+      "AWS_PROFILE": "",
+      "REGIONS": "all"
+    },
+    {
+      "NAME": "account-b",
+      "ACCOUNT_ID": "000000000002",
+      "ENABLED": true,
+      "AWS_ACCESS_KEY_ID": "",
+      "AWS_SECRET_ACCESS_KEY": "",
+      "AWS_SESSION_TOKEN": "",
+      "AWS_PROFILE": "",
+      "REGIONS": "all"
+    }
+  ]
+}
