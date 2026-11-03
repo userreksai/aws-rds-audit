@@ -3,6 +3,16 @@
 set -Eeuo pipefail
 # --check-only must not create __pycache__ while importing deployment helpers.
 export PYTHONDONTWRITEBYTECODE=1
+# An explicit JSON configuration selects the multi-account email deployment.
+# Keep the legacy installer available for existing profile/Lark deployments.
+MAIL_INSTALL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+MAIL_INSTALL_MODE=0
+for argument in "$@"; do
+  case "$argument" in --config|--config=*) MAIL_INSTALL_MODE=1 ;; esac
+done
+if ((MAIL_INSTALL_MODE)) || [[ -f "$MAIL_INSTALL_ROOT/rds-audit-config.json" ]]; then
+  exec bash "$MAIL_INSTALL_ROOT/install-mail.sh" "$@"
+fi
 trap 'printf "[错误] 安装中断（行 %s）；修正上方错误后可以重新运行。\n" "$LINENO" >&2' ERR
 
 usage() {

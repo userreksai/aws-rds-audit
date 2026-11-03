@@ -1,7 +1,7 @@
-"""Streaming user counters; statement text exists only while parsing one event.
+"""Streaming user or source-IP counters; statement text exists only while parsing.
 
 Temporary on-disk identities provide deduplication without a growing Python set.
-Only per-user counts and bounded quality reasons survive collection.
+Only summary counts and bounded quality reasons survive collection.
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from decimal import InvalidOperation
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import sqlite3
@@ -37,12 +38,36 @@ def _empty_coverage():
     return {**dict.fromkeys(COVERAGE_FIELDS, 0), "unknown_reasons": {}}
 
 
-def _actor(row):
+def _dimension(value):
+    if value not in {"user", "ip"}:
+        raise ValueError("summary dimension must be user or ip")
+    return value
+
+
+def _summary_format(dimension):
+    return {"schema_version": 2, "dimension": "ip"} if dimension == "ip" else {"schema_version": 1}
+
+
+def _actor(row, dimension="user"):
     kind = row["source_kind"]
     if kind not in {"management", "sql"}:
         raise ValueError("unsupported summary identity source")
     if not isinstance(row["actor"], str) or not isinstance(row["actor_key"], str):
         raise ValueError("summary actor names and keys must be strings")
+    if dimension == "ip":
+        source = row.get("source_ip", "")
+        if not isinstance(source, str):
+            raise ValueError("summary source_ip must be a string")
+        source = source.strip()
+        try:
+            source = str(ipaddress.ip_address(source))
+            actor_type = "来源 IP"
+        except ValueError:
+            actor_type = "来源主机" if source else "未知来源"
+        return {"actor": source or "未知来源", "actor_key": kind + ":source_ip:" + source,
+                "actor_type": actor_type, "source_kind": kind, "source_ip": source,
+                "total": 0, "failed": 0, "counts": dict.fromkeys(CATEGORIES, 0),
+                "attempted_counts": dict.fromkeys(CATEGORIES, 0)}
     key = "sql:username:" + str(row["actor"]) if kind == "sql" else str(row["actor_key"])
     return {"actor": str(row["actor"]), "actor_key": key,
             "actor_type": "数据库账号" if kind == "sql" else "AWS 身份", "source_kind": kind,
@@ -61,7 +86,8 @@ def save_summary(payload, directory):
 
 
 class SummaryAccumulator:
-    def __init__(self, directory, start, end):
+    def __init__(self, directory, start, end, dimension="user"):
+        self.dimension = _dimension(dimension)
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.start, self.end = _model().timestamp(start), _model().timestamp(end)
@@ -108,7 +134,7 @@ class SummaryAccumulator:
         self.coverage["unclassified"] += reason == "unclassified_sql"
 
     def _add_row(self, row):
-        actor = _actor(row)
+        actor = _actor(row, self.dimension)
         target = self.actors.setdefault(actor["actor_key"], actor)
         category = row["category"]
         target["total"] += 1
@@ -212,7 +238,7 @@ class SummaryAccumulator:
 
     def finish(self):
         coverage = {**self.coverage, "unknown_reasons": dict(sorted(self.unknown.items()))}
-        payload = {"schema_version": 1, "summary_only": True,
+        payload = {**_summary_format(self.dimension), "summary_only": True,
                    "window": {"start_inclusive": _model().iso(self.start), "end_exclusive": _model().iso(self.end)},
                    "actors": sorted(self.actors.values(), key=lambda row: (-row["total"], row["actor_key"])),
                    "coverage": coverage, "complete": not self.unknown,
@@ -221,8 +247,9 @@ class SummaryAccumulator:
         return payload
 
 
-def merge_summaries(payloads, start, end):
+def merge_summaries(payloads, start, end, dimension="user"):
     """Merge disjoint segments; gaps remain explicitly incomplete."""
+    dimension = _dimension(dimension)
     model = _model()
     start, end = model.timestamp(start), model.timestamp(end)
     if start >= end:
@@ -230,7 +257,11 @@ def merge_summaries(payloads, start, end):
     actors, coverage, unknown = {}, _empty_coverage(), Counter()
     windows, complete = [], True
     for payload in payloads:
-        if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1 or payload.get("summary_only") is not True:
+        expected_version = 2 if dimension == "ip" else 1
+        if (type(payload.get("schema_version")) is not int or payload["schema_version"] != expected_version or
+                payload.get("summary_only") is not True or
+                (dimension == "ip" and payload.get("dimension") != "ip") or
+                (dimension == "user" and payload.get("dimension") not in (None, "user"))):
             raise ValueError("unsupported operation summary format")
         if not isinstance(payload.get("complete"), bool) or not isinstance(payload.get("actors"), list) or not isinstance(payload.get("coverage"), dict):
             raise ValueError("invalid operation summary shape")
@@ -241,7 +272,9 @@ def merge_summaries(payloads, start, end):
         windows.append((left, right))
         complete &= payload.get("complete") is True
         for row in payload.get("actors", []):
-            sanitized = _actor(row)
+            if dimension == "ip" and "source_ip" not in row:
+                raise ValueError("IP operation summary is missing source_ip")
+            sanitized = _actor(row, dimension)
             total, failed = _number(row["total"]), _number(row["failed"])
             counts = {category: _number(row["counts"].get(category, 0)) for category in CATEGORIES}
             attempted = {category: _number(row["attempted_counts"].get(category, 0)) for category in CATEGORIES}
@@ -269,7 +302,7 @@ def merge_summaries(payloads, start, end):
     if position < end:
         complete = False
     coverage["unknown_reasons"] = dict(sorted(unknown.items()))
-    return {"schema_version": 1, "summary_only": True,
+    return {**_summary_format(dimension), "summary_only": True,
             "window": {"start_inclusive": model.iso(start), "end_exclusive": model.iso(end)},
             "actors": sorted(actors.values(), key=lambda row: (-row["total"], row["actor_key"])),
             "coverage": coverage, "complete": bool(complete and not unknown),
@@ -310,13 +343,13 @@ def summarize_archive(directory, start, end):
             return accumulator.finish()
 
 
-def validate_summary(payload, start, end):
+def validate_summary(payload, start, end, dimension="user"):
     model = _model()
     start, end = model.timestamp(start), model.timestamp(end)
     window = payload["window"]
     if model.timestamp(window["start_inclusive"]) != start or model.timestamp(window["end_exclusive"]) != end:
         raise ValueError("operation summary window does not match requested window")
-    result = merge_summaries([payload], start, end)
+    result = merge_summaries([payload], start, end, dimension=dimension)
     if payload.get("complete") is True and result["coverage"]["unparsed_records"]:
         raise ValueError("complete operation summary contains unresolved records")
     return result

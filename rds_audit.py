@@ -411,7 +411,8 @@ class Collector:
         try:
             if self.args.download_instance_logs:
                 raise ValueError("仅汇总模式不支持下载实例原始日志")
-            with SummaryAccumulator(self.directory, self.start, self.end) as accumulator:
+            with SummaryAccumulator(self.directory, self.start, self.end,
+                                    dimension=getattr(self.args, "summary_dimension", "user")) as accumulator:
                 self.accumulator = accumulator
                 regions = self.regions()
                 self.report["selected_regions"] = regions

@@ -13,6 +13,9 @@ credentials
 .env
 .env.*
 lark-config.json
+rds-audit-config.json
+output/
+tmp/
 
 # Password rotation state is private and must stay outside the served directory.
 auth-state/
