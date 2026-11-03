@@ -1,8 +1,8 @@
 # AWS RDS 多账号来源 IP 审计邮件
 
-在一个私有 JSON 中配置多个 AWS 账号，分段读取 RDS MySQL / Aurora MySQL 的 CloudWatch audit 日志，以**发起操作的来源 IP**汇总新增、删除、修改及失败次数。每个账号生成一份中文 PDF，所有启用账号的 PDF 作为附件放在同一封邮件中，支持收件人与抄送。
+在一个带中文注释的私有 JSON 配置中管理多个 AWS 账号，分段读取 RDS MySQL / Aurora MySQL 的 CloudWatch audit 日志，以**发起操作的来源 IP**汇总新增、删除、修改及失败次数。每个账号生成一份中文 PDF，所有启用账号的 PDF 作为附件放在同一封邮件中，支持收件人与抄送。
 
-默认每 30 分钟形成一个数据分段，也可配置为 60 分钟；每天北京时间 08:10 发送**昨日 00:00 至今日 00:00**的自然日汇总。不是旧版前日 07:00 至今日 08:00 的 25 小时窗口。时区、发信时间、采集间隔和本地保留天数都在 JSON 中配置。
+默认同时采集 7 个账号，每账号每 30 分钟形成一个数据分段，也可配置为 60 分钟；每天北京时间 08:10 发送**昨日 00:00 至今日 00:00**的自然日汇总。不是旧版前日 07:00 至今日 08:00 的 25 小时窗口。并发数、时区、发信时间、采集间隔和本地保留天数都在配置中调整。
 
 只保存来源 IP 汇总、覆盖状态和 PDF，不保存 SQL 原文、业务参数或逐条执行详情。数据库 SQL 与 RDS 管理 API 在 PDF 中分表，避免混成一种次数；同一账号内不同数据库用户的相同来源 IP 合并，AWS 账号之间始终隔离。
 
@@ -17,12 +17,13 @@ cp rds-audit-config.example.json rds-audit-config.json
 chmod 600 rds-audit-config.json
 ```
 
-填写私有 `rds-audit-config.json`。示例中的 Key、SMTP、收件人和抄送均已留空，不包含真实凭据。将示例账号 ID 换成自己的 12 位 AWS 账号 ID，每个账号分别填 Key：
+填写私有 `rds-audit-config.json`。完整模板已预留 **7 个账号**，可继续追加；Key、SMTP、Lark Webhook、签名密钥、收件人与抄送均留空。文件采用 **JSONC**，支持 `//` 行注释与 `/* */` 块注释，也兼容现有无注释 JSON。下方仅简写两个账号；将账号 ID 换成自己的 12 位 AWS 账号 ID，每个账号分别填 Key：
 
 ```json
 {
   "OUTPUT_DIRECTORY": "output",
   "COLLECTION_INTERVAL_MINUTES": 30,
+  "ACCOUNT_CONCURRENCY": 7,
   "RETENTION_DAYS": 7,
   "TIMEZONE": "Asia/Shanghai",
   "DAILY_MAIL_TIME": "08:10",
@@ -37,6 +38,12 @@ chmod 600 rds-audit-config.json
   "MAIL_CC": [],
   "MAIL_SUBJECT": "AW-RDS审计报告",
   "MAIL_SENDER_NAME": "",
+  "LARK_ALERTS_ENABLED": true,
+  "LARK_WEBHOOK_URL": "",
+  "LARK_SIGNING_SECRET": "",
+  "LARK_ALERT_AFTER_FAILURES": 2,
+  "LARK_ALERT_REPEAT_MINUTES": 60,
+  "LARK_NOTIFICATION_RETRY_MINUTES": 5,
   "ACCOUNTS": [
     {
       "NAME": "production",
@@ -64,10 +71,12 @@ chmod 600 rds-audit-config.json
 
 - `MAIL_RECIPIENTS` / `MAIL_CC` 使用邮箱数组，例如 `["audit@example.com", "ops@example.com"]`；CC 可为空。`SMTP_USERNAME` 同时作为发件邮箱。465 默认 SSL；需要 587 STARTTLS 时相应修改端口和 `SMTP_SECURITY`。
 - `NAME` 是目录标签，只支持字母、数字、下划线和连字符；`NAME` 与 `ACCOUNT_ID` 各自不得重复。真正采集前使用 STS 核验 Key 对应的账号，账号不匹配不会采集。
+- `ACCOUNT_CONCURRENCY` 是同时采集账号数，默认 7、范围 1-32；实际并发取该值与启用账号数的较小值。账号总数不受并发数限制，超出的账号自动排队；设为 1 即顺序采集。每个工作线程独立创建 boto3 Session、分页读取、分段和补采状态，不跨账号共享凭据或缓存。
 - 每账号支持成对的 Access Key / Secret Key、临时凭据 Token，或 `AWS_PROFILE`；Key 与 profile 不可同时配置。均为空时使用该服务用户的标准 AWS 凭据链。`ENABLED: false` 暂停该账号采集和报告。
 - `OUTPUT_DIRECTORY` 相对**配置文件所在目录**解析，所以默认输出为 `/usr/local/aws-rds-shenji/output/`；也可填写绝对路径。不要指向网页公开目录。
 - 完整示例还包括 `MAX_BUCKETS_PER_ACCOUNT_PER_RUN`（默认 6）、`LOG_DELAY_MINUTES`（默认 5）、`REFRESH_DELAY_MINUTES`（默认 60）和 `PDF_FONT_PATH`（可选中文 TTF 字体）。
 - 私有配置与 `output/` 已加入 Git 忽略规则。不要提交真实 Key 或 SMTP 授权码；源码更新不会替换私有配置。
+- 新模板默认开启 Lark 异常告警，安装前填写 `LARK_WEBHOOK_URL`；支持 Lark 与飞书群机器人，启用签名校验时填 `LARK_SIGNING_SECRET`。没有这些字段的旧配置默认关闭，合并新配置时需显式添加并开启。
 
 每个账号使用 [iam-policy-rds-audit.json](iam-policy-rds-audit.json) 的读取权限。新模式主要使用 CloudTrail `LookupEvents`、CloudWatch `DescribeLogGroups` / `FilterLogEvents`；`REGIONS: "all"` 还需要 EC2 `DescribeRegions`。程序不修改数据库、审计设置、IAM 或 Nginx。数据库当时必须已经启用相应审计并导出到 CloudWatch；详细说明见 [RDS_AUDIT.md](RDS_AUDIT.md)。
 
@@ -102,7 +111,15 @@ sudo bash install.sh --config ./rds-audit-config.json --user root --no-enable
 
 首次部署从昨日零点开始逐段回填，每账号每轮最多处理 6 段；补齐昨日和今日可能需要多轮。采集预留 5 分钟日志发布缓冲；成功分段在结束 60 分钟后再采一次，使用新快照**替换**旧快照，不累加重复计数。失败分段以 5 分钟至 1 小时退避重试，在保留窗口内继续补采。更迟到达或已被源端删除的日志仍可能缺失。
 
-账号失败不会阻止其它账号继续采集。全局进程锁避免采集、清理与发信互相覆盖；遇忙等待下一轮。邮件正文列出每个账号的覆盖状态；没有数据、缺段和解析失败不会伪装成完整的零操作。
+账号失败不会阻止其它账号继续采集。同类采集任务和同类邮件任务各自加锁，避免重叠运行；采集与邮件可同时进行，邮件读取已经原子提交的本地快照，长时间采集不会一直阻塞日报。进行中的分段标记为不完整；清理只在采集和邮件都空闲时执行，忙时延到下一轮。邮件正文列出每个账号的覆盖状态；没有数据、缺段和解析失败不会伪装成完整的零操作。
+
+## 补采失败与 Lark 异常群
+
+分段首次失败先保留状态，默认 5 分钟后自动补采，连续失败按 5、10、20、40 分钟到最多 1 小时退避。`LARK_ALERT_AFTER_FAILURES: 2` 表示**首次采集失败，加一次补采仍失败**时通知异常群。身份或凭据查询失败也会跨轮累计，并发送账号级异常，不能因没有取得分段而漏报。
+
+多个失败分段合并为异常摘要，消息仅包含账号、分段窗口、尝试次数和安全错误类型，不包含 SQL、Key、Webhook 或供应商响应正文。同一持续故障默认 60 分钟最多重复提醒一次；已通知的问题恢复采集后发送恢复通知。Lark 自身发送失败会持久保留待发状态，默认 5 分钟后重试，不阻断其它账号采集。若进程在 API 调用中退出或被超时终止，下轮通过持久 `in_progress` 标记识别失败并补采，连续中断也进入告警。
+
+告警只用于采集与补采异常，正常日报仍通过邮件发送。按 HTTP Webhook 的能力边界，网络超时后重试可能产生重复消息；消息携带事件编号，便于识别。所有调用结果以本地状态和群机器人实际回执为准。
 
 ## 本地存储与自动保留
 

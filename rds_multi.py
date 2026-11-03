@@ -7,7 +7,7 @@ The legacy user-report CLI remains available in rds_audit.py.
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
@@ -171,11 +171,10 @@ def verify_account(session, account):
 def collect_bucket(config, account, session, identity, start, end, directory):
     args = SimpleNamespace(regions=account["REGIONS"], discovery_region=None,
                            download_sql_logs=True, download_instance_logs=False,
-                           metadata_light=True, summary_dimension="ip")
+                           metadata_light=True, summary_dimension="ip", quiet=True)
     collector = Collector(session, sdk_config(), start, end, directory, args, identity)
-    # Provider errors and raw responses must never appear in unattended logs.
-    with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
-        result = collector.run()
+    # Per-instance quiet mode avoids process-global stdout mutation in threads.
+    result = collector.run()
     summary = validate_summary(read_json(directory / "operation-summary.json"), start, end, dimension="ip")
     report = collector.report
     groups = sum(group["logGroupName"].endswith("/audit") for region in report["regions"].values()
@@ -196,16 +195,39 @@ def load_bucket(path, config, account, start, end):
             or value.get("scope") != scope_for(config, account)
             or value.get("window") != {"start_inclusive": iso(start), "end_exclusive": iso(end)}):
         raise ValueError("分段账号、窗口或配置不匹配")
-    for name in ("attempts", "next_retry"):
+    for name in ("attempts", "next_retry", "consecutive_failures"):
         if type(value.get(name, 0)) is not int or value.get(name, 0) < 0:
             raise ValueError("分段重试状态必须为非负整数")
     if not isinstance(value.get("last_errors", []), list):
         raise ValueError("分段错误状态必须为数组")
+    if not isinstance(value.get("in_progress", False), bool):
+        raise ValueError("分段运行状态必须为布尔值")
     if value.get("active") is not None:
         if not isinstance(value["active"], dict) or not isinstance(value["active"].get("complete"), bool):
             raise ValueError("分段完整度必须为布尔值")
         validate_summary(value["active"]["summary"], start, end, dimension="ip")
     return value
+
+
+def dispatch_collection_alerts(config, account, root, observations, now):
+    if not config.get("LARK_ALERTS_ENABLED", False):
+        return {"sent": 0, "pending": 0, "failed": 0}
+    try:
+        from rds_failure_alerts import sync_collection_alerts
+
+        return sync_collection_alerts(config, account, root / ".lark-state.json", observations, now)
+    except Exception as exc:
+        print(f"账号 {account['ACCOUNT_ID']}：Lark异常通知待重试（{type(exc).__name__}）。", file=sys.stderr)
+        return {"sent": 0, "pending": 1, "failed": 1}
+
+
+def bucket_observation(config, account, state, start, end):
+    return {"key": "bucket:" + scope_id(config, account) + ":" + iso(start),
+            "failed": bool(state.get("last_errors")) or not bool((state.get("active") or {}).get("complete")),
+            "consecutive_failures": state.get("consecutive_failures", 0), "attempts": state.get("attempts", 0),
+            "bucket_start": iso(start), "bucket_end": iso(end),
+            "error_types": [str(error.get("error_type", "CollectionError")) for error in state.get("last_errors", [])
+                            if isinstance(error, dict)]}
 
 
 def collect_account(config, account, now, *, session_factory=create_session, collector=collect_bucket):
@@ -229,7 +251,8 @@ def collect_account(config, account, now, *, session_factory=create_session, col
         atomic_json(info_path, {"first_date": first.isoformat()})
     first = max(first, today - timedelta(days=config["RETENTION_DAYS"] - 1))
     cutoff = now - timedelta(minutes=config["LOG_DELAY_MINUTES"])
-    pending, refresh = [], []
+    pending, refresh, observations = [], [], {}
+    interrupted = False
     day = first
     while day <= today:
         for start, end in windows(day, zone, config["COLLECTION_INTERVAL_MINUTES"]):
@@ -240,6 +263,15 @@ def collect_account(config, account, now, *, session_factory=create_session, col
                 state = load_bucket(path, config, account, start, end) if path.exists() else {}
             except (ValueError, KeyError, TypeError):
                 state = {}  # A corrupt checkpoint is collected again, never counted as zero.
+            if state.get("in_progress"):
+                # The OS lock has been reacquired, so the previous worker exited
+                # before committing. Count that failed attempt and recollect it.
+                state.update(in_progress=False, consecutive_failures=state.get("consecutive_failures", 0) + 1,
+                             last_errors=[{"scope": "collect", "error_type": "InterruptedCollection"}], next_retry=0)
+                atomic_json(path, state)
+                interrupted = True
+            if state:
+                observations[iso(start)] = bucket_observation(config, account, state, start, end)
             if state.get("next_retry", 0) > now.timestamp():
                 continue
             active = state.get("active")
@@ -251,9 +283,16 @@ def collect_account(config, account, now, *, session_factory=create_session, col
         day += timedelta(days=1)
     # Prioritise fresh/missing data over the single delayed refresh of complete buckets.
     done, failed = 0, 0
+    if interrupted:
+        dispatch_collection_alerts(config, account, root, list(observations.values()), now)
     for start, end, path, state in (pending + refresh)[:config["MAX_BUCKETS_PER_ACCOUNT_PER_RUN"]]:
         attempt = int(state.get("attempts", 0)) + 1
+        previous_failures = state.get("consecutive_failures", 0)
         previous = state.get("active")
+        state.update(schema_version=1, scope=scope_for(config, account),
+                     window={"start_inclusive": iso(start), "end_exclusive": iso(end)},
+                     attempts=attempt, in_progress=True, last_attempt_at=iso(now))
+        atomic_json(path, state)
         errors = []
         try:
             with tempfile.TemporaryDirectory(prefix=".attempt-", dir=path.parent) as temporary:
@@ -270,35 +309,66 @@ def collect_account(config, account, now, *, session_factory=create_session, col
         if not succeeded and not errors:
             errors = [{"scope": "collect", "error_type": "IncompleteCollection"}]
         refreshed = bool(state.get("refresh_done")) or (succeeded and now >= end + timedelta(minutes=config["REFRESH_DELAY_MINUTES"]))
+        consecutive = 0 if succeeded else previous_failures + 1
         state.update(schema_version=1, scope=scope_for(config, account),
                      window={"start_inclusive": iso(start), "end_exclusive": iso(end)},
-                     attempts=attempt, last_attempt_at=iso(now), last_errors=errors,
+                     attempts=attempt, last_attempt_at=iso(now), last_errors=errors, in_progress=False,
+                     consecutive_failures=consecutive,
                      refresh_done=refreshed,
-                     next_retry=0 if succeeded else int(now.timestamp()) + min(3600, 300 * 2 ** min(attempt - 1, 4)))
+                     next_retry=0 if succeeded else int(now.timestamp()) + min(3600, 300 * 2 ** min(consecutive - 1, 4)))
         atomic_json(path, state)
+        observations[iso(start)] = bucket_observation(config, account, state, start, end)
         done += 1
         failed += not succeeded
-    return {"processed": done, "failed": failed, "remaining": max(0, len(pending + refresh) - done)}
+    result = {"processed": done, "failed": failed, "remaining": max(0, len(pending + refresh) - done)}
+    notification = dispatch_collection_alerts(config, account, root, list(observations.values()), now)
+    if config.get("LARK_ALERTS_ENABLED", False):
+        result.update(alert_failed=notification["failed"], alert_pending=notification["pending"])
+    return result
+
+
+def _collect_one_account(config, account, now, kwargs):
+    try:
+        result = collect_account(config, account, now, **kwargs)
+    except Exception as exc:
+        # No arbitrary provider error text or credential values persist.
+        result = {"processed": 0, "failed": 1, "error_type": type(exc).__name__}
+    try:
+        directory = day_directory(config, account, now.astimezone(ZoneInfo(config["TIMEZONE"])).date())
+        if config.get("LARK_ALERTS_ENABLED", False):
+            health_path = directory.parent / ".collection-health.json"
+            try:
+                health = read_json(health_path) if health_path.exists() else {}
+                count = health.get("consecutive_failures", 0)
+                if type(count) is not int or count < 0:
+                    raise ValueError("invalid health counter")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                count = 0
+            unhealthy = bool(result.get("error_type"))
+            count = count + 1 if unhealthy else 0
+            atomic_json(health_path, {"consecutive_failures": count, "at": iso(now)})
+            notification = dispatch_collection_alerts(config, account, directory.parent,
+                [{"key": "account-health", "failed": unhealthy, "consecutive_failures": count,
+                  "attempts": count, "error_types": [result["error_type"]] if unhealthy else []}], now)
+            result.update(alert_failed=result.get("alert_failed", 0) + notification["failed"],
+                          alert_pending=notification["pending"])
+        atomic_json(directory / "collection-status.json", {"at": iso(now), **result})
+    except Exception as exc:
+        result.update(failed=max(1, result["failed"]), storage_error_type=type(exc).__name__)
+    print(f"账号 {account['NAME']} ({account['ACCOUNT_ID']})：采集 {result['processed']} 段，失败 {result['failed']}。")
+    return {"account_id": account["ACCOUNT_ID"], **result}
 
 
 def collect_accounts(config, now, **kwargs):
-    results = []
-    for account in config["ACCOUNTS"]:
-        if not account["ENABLED"]:
-            continue
-        try:
-            result = collect_account(config, account, now, **kwargs)
-        except Exception as exc:
-            # No arbitrary provider error text or credential values persist.
-            result = {"processed": 0, "failed": 1, "error_type": type(exc).__name__}
-        try:
-            directory = day_directory(config, account, now.astimezone(ZoneInfo(config["TIMEZONE"])).date())
-            atomic_json(directory / "collection-status.json", {"at": iso(now), **result})
-        except Exception as exc:
-            result.update(failed=max(1, result["failed"]), storage_error_type=type(exc).__name__)
-        results.append({"account_id": account["ACCOUNT_ID"], **result})
-        print(f"账号 {account['NAME']} ({account['ACCOUNT_ID']})：采集 {result['processed']} 段，失败 {result['failed']}。")
-    return results
+    accounts = [account for account in config["ACCOUNTS"] if account["ENABLED"]]
+    if not accounts:
+        return []
+    workers = min(config.get("ACCOUNT_CONCURRENCY", 7), len(accounts))
+    # One worker owns each account's session, checkpoints and alert state. There
+    # is no concurrent paging within an account and no shared boto3 Session.
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rds-account") as pool:
+        futures = [pool.submit(_collect_one_account, config, account, now, kwargs) for account in accounts]
+        return [future.result() for future in futures]
 
 
 def build_report(config, account, day, now):
@@ -327,7 +397,7 @@ def build_report(config, account, day, now):
                 raise ValueError("missing active snapshot")
             summaries.append(active["summary"])
             present += 1
-            if not active.get("complete") or state.get("last_errors"):
+            if not active.get("complete") or state.get("last_errors") or state.get("in_progress"):
                 errors.append({"scope": iso(left), "error_type": "IncompleteCollection"})
         except (OSError, ValueError, KeyError, TypeError):
             errors.append({"scope": iso(left), "error_type": "MissingOrInvalidBucket"})
@@ -452,6 +522,15 @@ def scheduled_day(config, now):
     return local.date() - timedelta(days=1)
 
 
+def prune_when_idle(config, today, other_lock):
+    # Collection and PDF/mail may run together. Retention requires both mode
+    # locks so it cannot remove a directory being read or written by either.
+    with _exclusive(other_lock) as idle:
+        if idle:
+            for item in prune(config, today):
+                print("已清理过期日期目录：" + item)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=PROJECT / "rds-audit-config.json")
@@ -486,20 +565,42 @@ def main(argv=None):
                         print(f"账号 {account['ACCOUNT_ID']}：预检失败（{type(exc).__name__}），检查身份、权限、区域和 audit 日志。", file=sys.stderr)
             return 2 if failures else 0
         root = safe_directory(config["OUTPUT_DIRECTORY"])
-        with _exclusive(root / ".multi-account.lock") as acquired:
+        mode = "collect" if args.collect else "delivery"
+        other = "delivery" if args.collect else "collect"
+        with _exclusive(root / (".multi-account." + mode + ".lock")) as acquired:
             if not acquired:
-                print("已有多账号采集或邮件任务运行，等待下一轮。")
+                print("已有同类多账号任务运行，等待下一轮。")
                 return 0
             now = datetime.now(UTC)
             today = now.astimezone(ZoneInfo(config["TIMEZONE"])).date()
+            if args.date and (args.date > today or args.date < today - timedelta(days=config["RETENTION_DAYS"] - 1)):
+                raise ValueError("报告日期必须位于当前本地保留窗口内")
+            # Prepare shared account/day ownership markers in a short critical
+            # section; no network request or PDF rendering holds this lock.
+            with _exclusive(root / ".multi-account.layout.lock") as ready:
+                if not ready:
+                    return 0
+                days = {today - timedelta(days=offset) for offset in range(config["RETENTION_DAYS"])}
+                for account in config["ACCOUNTS"]:
+                    if account["ENABLED"]:
+                        for day in days:
+                            try:
+                                day_directory(config, account, day)
+                            except (OSError, ValueError):
+                                # Each account worker / report will surface its
+                                # own storage error without adopting unknown data.
+                                pass
             if not any(account["ENABLED"] for account in config["ACCOUNTS"]):
-                prune(config, today)
+                prune_when_idle(config, today, root / (".multi-account." + other + ".lock"))
                 print("没有启用账号，已跳过采集和邮件。")
                 return 0
             result = 0
             if args.collect:
+                # Expire old data before long polling too, so a worker killed by
+                # its runtime limit cannot indefinitely postpone retention.
+                prune_when_idle(config, today, root / (".multi-account." + other + ".lock"))
                 results = collect_accounts(config, now)
-                result = 2 if any(item["failed"] for item in results) else 0
+                result = 2 if any(item["failed"] or item.get("alert_failed") or item.get("alert_pending") for item in results) else 0
             elif args.scheduled:
                 day = scheduled_day(config, now)
                 if day is not None:
@@ -516,8 +617,7 @@ def main(argv=None):
                     reports, attachments = report_accounts(config, day, now)
                     print("PDF 已生成：\n" + "\n".join(str(path) for path in attachments))
                     result = 0 if all(report["complete"] for report in reports) else 2
-            for item in prune(config, today):
-                print("已清理过期日期目录：" + item)
+            prune_when_idle(config, today, root / (".multi-account." + other + ".lock"))
             return result
     except Exception as exc:
         # Config validation messages contain field names only; no provider bodies.

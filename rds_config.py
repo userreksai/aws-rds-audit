@@ -1,4 +1,4 @@
-"""Validated private JSON settings for multi-account RDS IP audit delivery.
+"""Validated private JSON/JSONC settings for multi-account RDS IP audit delivery.
 
 Configuration errors name fields, never credential values or provider replies.
 Relative data/font paths are resolved beside the configuration file.
@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 DEFAULTS = {
     "OUTPUT_DIRECTORY": "output",
     "COLLECTION_INTERVAL_MINUTES": 30,
+    "ACCOUNT_CONCURRENCY": 7,
     "RETENTION_DAYS": 7,
     "TIMEZONE": "Asia/Shanghai",
     "DAILY_MAIL_TIME": "08:10",
@@ -35,6 +36,14 @@ DEFAULTS = {
     "MAX_BUCKETS_PER_ACCOUNT_PER_RUN": 6,
     "LOG_DELAY_MINUTES": 5,
     "REFRESH_DELAY_MINUTES": 60,
+    # Existing JSON files keep their prior notification behavior. New templates
+    # explicitly opt into collection-failure alerts after one failed retry.
+    "LARK_ALERTS_ENABLED": False,
+    "LARK_WEBHOOK_URL": "",
+    "LARK_SIGNING_SECRET": "",
+    "LARK_ALERT_AFTER_FAILURES": 2,
+    "LARK_ALERT_REPEAT_MINUTES": 60,
+    "LARK_NOTIFICATION_RETRY_MINUTES": 5,
 }
 ACCOUNT_DEFAULTS = {
     "AWS_ACCESS_KEY_ID": "",
@@ -130,6 +139,27 @@ def _regions(value):
     return ",".join(regions)
 
 
+def _validate_lark_settings(config, require_complete):
+    if not isinstance(config["LARK_ALERTS_ENABLED"], bool):
+        raise ValueError("LARK_ALERTS_ENABLED 必须为 true 或 false")
+    for key in ("LARK_WEBHOOK_URL", "LARK_SIGNING_SECRET"):
+        config[key] = _text(config[key], key)
+    _integer(config["LARK_ALERT_AFTER_FAILURES"], "LARK_ALERT_AFTER_FAILURES", minimum=2)
+    _integer(config["LARK_ALERT_REPEAT_MINUTES"], "LARK_ALERT_REPEAT_MINUTES")
+    _integer(config["LARK_NOTIFICATION_RETRY_MINUTES"], "LARK_NOTIFICATION_RETRY_MINUTES")
+    if config["LARK_WEBHOOK_URL"]:
+        from lark_notify import validate_webhook_url
+
+        try:
+            validate_webhook_url(config["LARK_WEBHOOK_URL"])
+        except ValueError:
+            # Do not propagate a token-bearing URL or any future validator's
+            # arbitrary message into unattended task logs.
+            raise ValueError("LARK_WEBHOOK_URL 必须为有效的 Lark/飞书 HTTPS 群机器人地址") from None
+    elif require_complete and config["LARK_ALERTS_ENABLED"]:
+        raise ValueError("启用异常群通知时必须填写 LARK_WEBHOOK_URL")
+
+
 def _unique_json_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -139,15 +169,79 @@ def _unique_json_pairs(pairs):
     return result
 
 
+def strip_json_comments(text):
+    """Remove JSONC comments while preserving strings and source positions.
+
+    Comment characters become spaces, with CR/LF kept intact. This prevents a
+    comment between two tokens from silently joining them, and keeps JSON
+    decoder line numbers useful. Escaped quotes and backslashes are scanned
+    before testing string delimiters; URL slashes inside strings are literal.
+    Trailing commas and other JSON extensions are deliberately not accepted by
+    the subsequent JSON decoder.
+    """
+    if not isinstance(text, str):
+        raise ValueError("配置内容必须为字符串")
+    result = []
+    position, length = 0, len(text)
+    in_string = escaped = False
+    while position < length:
+        char = text[position]
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            position += 1
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            position += 1
+            continue
+        if char == "/" and position + 1 < length and text[position + 1] == "/":
+            result.extend((" ", " "))
+            position += 2
+            while position < length and text[position] not in "\r\n":
+                result.append(" ")
+                position += 1
+            continue
+        if char == "/" and position + 1 < length and text[position + 1] == "*":
+            result.extend((" ", " "))
+            position += 2
+            while position < length:
+                if text[position:position + 2] == "*/":
+                    result.extend((" ", " "))
+                    position += 2
+                    break
+                result.append(text[position] if text[position] in "\r\n" else " ")
+                position += 1
+            else:
+                raise ValueError("配置块注释未闭合")
+            continue
+        result.append(char)
+        position += 1
+    if in_string:
+        raise ValueError("配置字符串未闭合")
+    return "".join(result)
+
+
+def _reject_json_constant(_value):
+    raise ValueError("配置不能包含非 JSON 数值常量")
+
+
 def load_config(path, require_mail=False):
     """Load private settings without creating files or contacting AWS/SMTP."""
     source = Path(path).expanduser().resolve()
     try:
-        raw = json.loads(source.read_text(encoding="utf-8-sig"), object_pairs_hook=_unique_json_pairs)
+        content = strip_json_comments(source.read_text(encoding="utf-8-sig"))
+        raw = json.loads(content, object_pairs_hook=_unique_json_pairs, parse_constant=_reject_json_constant)
     except OSError:
         raise ValueError("无法读取配置文件，请检查路径和权限") from None
     except (ValueError, UnicodeError):
-        raise ValueError("配置文件不是有效且无重复字段的 UTF-8 JSON") from None
+        raise ValueError("配置文件不是有效且无重复字段的 UTF-8 JSON/JSONC，请检查语法和注释闭合") from None
     if not isinstance(raw, dict):
         raise ValueError("配置必须为 JSON 对象")
     result = {**deepcopy(DEFAULTS), **raw}
@@ -161,6 +255,7 @@ def load_config(path, require_mail=False):
     _integer(result["COLLECTION_INTERVAL_MINUTES"], "COLLECTION_INTERVAL_MINUTES")
     if result["COLLECTION_INTERVAL_MINUTES"] not in (30, 60):
         raise ValueError("COLLECTION_INTERVAL_MINUTES 必须为 30 或 60")
+    _integer(result["ACCOUNT_CONCURRENCY"], "ACCOUNT_CONCURRENCY", maximum=32)
     # Yesterday must survive until its scheduled morning PDF/mail is produced.
     _integer(result["RETENTION_DAYS"], "RETENTION_DAYS", minimum=2)
     _integer(result["MAX_BUCKETS_PER_ACCOUNT_PER_RUN"], "MAX_BUCKETS_PER_ACCOUNT_PER_RUN")
@@ -174,6 +269,7 @@ def load_config(path, require_mail=False):
         raise ValueError("DAILY_MAIL_TIME 必须为 HH:MM")
     if result["MAIL_REPORT_MODE"] != "previous_day":
         raise ValueError("MAIL_REPORT_MODE 目前仅支持 previous_day 自然日汇总")
+    _validate_lark_settings(result, require_complete=require_mail)
     result.update(validate_mail_config(result, require_complete=require_mail))
     accounts = result.get("ACCOUNTS")
     if not isinstance(accounts, list) or not accounts:

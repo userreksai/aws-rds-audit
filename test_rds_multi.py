@@ -5,7 +5,10 @@ from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 import json
 from pathlib import Path
+import sys
 import tempfile
+import threading
+from types import ModuleType
 import unittest
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -27,7 +30,7 @@ class MultiFixture(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.config = {**deepcopy(DEFAULTS), "OUTPUT_DIRECTORY": str(self.root / "data"),
-                       "TIMEZONE": "UTC", "SMTP_HOST": "smtp.example.com",
+                       "TIMEZONE": "UTC", "ACCOUNT_CONCURRENCY": 1, "SMTP_HOST": "smtp.example.com",
                        "SMTP_USERNAME": "audit@example.com", "SMTP_AUTH_CODE": "PRIVATE-SMTP-CODE",
                        "MAIL_RECIPIENTS": ["recipient@example.com"], "MAIL_CC": ["copy@example.com"],
                        "ACCOUNTS": [
@@ -352,6 +355,354 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(multi.scheduled_day(config, datetime(2026, 11, 3, 0, 10, tzinfo=UTC)), date(2026, 11, 2))
 
 
+class AccountConcurrencyTests(MultiFixture):
+    def accounts(self, count):
+        self.config["ACCOUNTS"] = [{**ACCOUNT_DEFAULTS, "NAME": "account-" + str(index),
+                                   "ACCOUNT_ID": str(100000000000 + index), "REGIONS": "us-east-1"}
+                                  for index in range(count)]
+        for account in self.config["ACCOUNTS"]:
+            self.seed_start(account)
+
+    def test_eight_accounts_overlap_within_configured_limit_and_fail_independently(self):
+        self.accounts(8)
+        self.config["ACCOUNT_CONCURRENCY"] = 3
+        rendezvous = threading.Barrier(3)
+        rendezvous_ids = {account["ACCOUNT_ID"] for account in self.config["ACCOUNTS"][:3]}
+        lock = threading.Lock()
+        active = peak = 0
+        sessions, identities = {}, {}
+
+        def collector(config, account, session, identity, left, right, directory):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                sessions[account["ACCOUNT_ID"]] = session
+                identities[account["ACCOUNT_ID"]] = identity["Account"]
+            try:
+                if account["ACCOUNT_ID"] in rendezvous_ids:
+                    # A sequential implementation cannot pass this rendezvous.
+                    rendezvous.wait(timeout=15)
+                if account["ACCOUNT_ID"] == self.config["ACCOUNTS"][0]["ACCOUNT_ID"]:
+                    raise RuntimeError("one account failed without blocking others")
+                return self.snapshot(left, right)
+            finally:
+                with lock:
+                    active -= 1
+
+        with redirect_stdout(StringIO()):
+            results = multi.collect_accounts(self.config, MIDNIGHT + timedelta(minutes=35),
+                                             session_factory=self.session, collector=collector)
+        self.assertEqual(peak, 3)
+        self.assertEqual(active, 0)
+        self.assertEqual([row["account_id"] for row in results], [account["ACCOUNT_ID"] for account in self.config["ACCOUNTS"]])
+        self.assertEqual([row["failed"] for row in results], [1] + [0] * 7)
+        self.assertEqual(len({id(session) for session in sessions.values()}), 8)
+        self.assertEqual(identities, {account["ACCOUNT_ID"]: account["ACCOUNT_ID"] for account in self.config["ACCOUNTS"]})
+
+    def test_seven_enabled_accounts_can_all_collect_concurrently(self):
+        self.accounts(7)
+        self.config["ACCOUNT_CONCURRENCY"] = 7
+        rendezvous = threading.Barrier(7)
+        lock = threading.Lock()
+        active = peak = 0
+
+        def collector(config, account, session, identity, left, right, directory):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                rendezvous.wait(timeout=15)
+                return self.snapshot(left, right)
+            finally:
+                with lock:
+                    active -= 1
+
+        with redirect_stdout(StringIO()):
+            results = multi.collect_accounts(self.config, MIDNIGHT + timedelta(minutes=35),
+                                             session_factory=self.session, collector=collector)
+        self.assertEqual(peak, 7)
+        self.assertEqual(len(results), 7)
+        self.assertTrue(all(row["processed"] == 1 and row["failed"] == 0 for row in results))
+
+    def test_concurrency_one_preserves_sequential_account_work(self):
+        self.accounts(3)
+        self.config["ACCOUNT_CONCURRENCY"] = 1
+        events = []
+
+        def collector(config, account, session, identity, left, right, directory):
+            events.append((account["ACCOUNT_ID"], "start"))
+            snapshot = self.snapshot(left, right)
+            events.append((account["ACCOUNT_ID"], "end"))
+            return snapshot
+
+        with redirect_stdout(StringIO()):
+            results = multi.collect_accounts(self.config, MIDNIGHT + timedelta(minutes=35),
+                                             session_factory=self.session, collector=collector)
+        expected = [(account["ACCOUNT_ID"], event) for account in self.config["ACCOUNTS"] for event in ("start", "end")]
+        self.assertEqual(events, expected)
+        self.assertEqual([row["account_id"] for row in results], [account["ACCOUNT_ID"] for account in self.config["ACCOUNTS"]])
+
+
+class CollectionFailureIntegrationTests(MultiFixture):
+    def setUp(self):
+        super().setUp()
+        self.config.update(LARK_ALERTS_ENABLED=True, LARK_ALERT_AFTER_FAILURES=2,
+                           LARK_ALERT_REPEAT_MINUTES=60, LARK_NOTIFICATION_RETRY_MINUTES=5)
+
+    def notifications(self):
+        return Mock(return_value={"sent": 0, "pending": 0, "failed": 0})
+
+    def observed_bucket(self, notifier):
+        observations = notifier.call_args.args[3]
+        return next(item for item in observations if item["key"].startswith("bucket:"))
+
+    def test_retry_failures_persist_and_success_resets_consecutive_count(self):
+        self.seed_start()
+        now = MIDNIGHT + timedelta(minutes=35)
+        notifier = self.notifications()
+        failing = Mock(side_effect=RuntimeError("mock CloudWatch failure"))
+        with patch.object(multi, "dispatch_collection_alerts", notifier):
+            first = multi.collect_account(self.config, self.account, now, session_factory=self.session, collector=failing)
+            self.assertEqual(first["failed"], 1)
+            observation = self.observed_bucket(notifier)
+            self.assertEqual(observation["consecutive_failures"], 1)
+            self.assertTrue(observation["failed"])
+            self.assertLess(observation["consecutive_failures"], self.config["LARK_ALERT_AFTER_FAILURES"])
+            # Recreate the collector/session and reread disk state as a later worker would.
+            second = multi.collect_account(self.config, self.account, now + timedelta(minutes=5),
+                                           session_factory=self.session, collector=Mock(side_effect=RuntimeError("retry failed")))
+            self.assertEqual(second["failed"], 1)
+            self.assertEqual(self.observed_bucket(notifier)["consecutive_failures"], 2)
+            path = multi.bucket_path(self.config, self.account, MIDNIGHT)
+            self.assertEqual(multi.read_json(path)["consecutive_failures"], 2)
+            waiting = Mock()
+            third = multi.collect_account(self.config, self.account, now + timedelta(minutes=10),
+                                          session_factory=self.session, collector=waiting)
+            waiting.assert_not_called()
+            self.assertEqual(third["processed"], 0)
+            self.assertEqual(self.observed_bucket(notifier)["consecutive_failures"], 2)
+            recovered = multi.collect_account(self.config, self.account, now + timedelta(minutes=15),
+                                              session_factory=self.session,
+                                              collector=lambda c, a, s, i, left, right, d: self.snapshot(left, right))
+            self.assertEqual(recovered["failed"], 0)
+            observation = self.observed_bucket(notifier)
+            self.assertEqual(observation["consecutive_failures"], 0)
+            self.assertFalse(observation["failed"])
+            self.assertEqual(multi.read_json(path)["consecutive_failures"], 0)
+
+    def test_first_failed_refresh_does_not_reuse_lifetime_attempts_for_alert_or_backoff(self):
+        self.seed_start()
+        path = self.checkpoint(MIDNIGHT, MIDNIGHT + timedelta(minutes=30), count=2, refresh_done=False)
+        state = multi.read_json(path)
+        state.update(attempts=20, consecutive_failures=0)
+        multi.atomic_json(path, state)
+        for offset in (30, 60, 90):
+            self.checkpoint(MIDNIGHT + timedelta(minutes=offset), MIDNIGHT + timedelta(minutes=offset + 30), count=0)
+        now = MIDNIGHT + timedelta(hours=2, minutes=5)
+        notifier = self.notifications()
+        with patch.object(multi, "dispatch_collection_alerts", notifier):
+            multi.collect_account(self.config, self.account, now, session_factory=self.session,
+                                  collector=Mock(side_effect=RuntimeError("first refresh failure")))
+        state = multi.read_json(path)
+        self.assertEqual(state["attempts"], 21)
+        self.assertEqual(state["consecutive_failures"], 1)
+        self.assertEqual(state["next_retry"], int(now.timestamp()) + 300)
+        observation = next(row for row in notifier.call_args.args[3] if row["bucket_start"] == multi.iso(MIDNIGHT))
+        self.assertEqual(observation["consecutive_failures"], 1)
+        self.assertLess(observation["consecutive_failures"], self.config["LARK_ALERT_AFTER_FAILURES"])
+        self.assertEqual(state["active"]["summary"]["actors"][0]["total"], 2)
+
+    def test_two_identity_failures_are_account_scoped_and_other_account_continues(self):
+        for account in self.config["ACCOUNTS"]:
+            self.seed_start(account)
+        now = MIDNIGHT + timedelta(minutes=35)
+        notifier = self.notifications()
+        identity_bad = True
+
+        def session_factory(account):
+            return self.session(account, mismatch=identity_bad and account is self.account)
+
+        def collector(config, account, session, identity, left, right, directory):
+            return self.snapshot(left, right)
+
+        with patch.object(multi, "dispatch_collection_alerts", notifier), redirect_stdout(StringIO()):
+            first = multi.collect_accounts(self.config, now, session_factory=session_factory, collector=collector)
+            second = multi.collect_accounts(self.config, now + timedelta(minutes=5), session_factory=session_factory, collector=collector)
+            self.assertEqual([row["failed"] for row in first], [1, 0])
+            self.assertEqual([row["failed"] for row in second], [1, 0])
+            health = [(call.args[1]["ACCOUNT_ID"], observation) for call in notifier.call_args_list
+                      for observation in call.args[3] if observation["key"] == "account-health"]
+            bad = [row for account, row in health if account == self.account["ACCOUNT_ID"]]
+            good = [row for account, row in health if account != self.account["ACCOUNT_ID"]]
+            self.assertEqual([row["consecutive_failures"] for row in bad], [1, 2])
+            self.assertTrue(all(row["failed"] for row in bad))
+            self.assertTrue(all(not row["failed"] and row["consecutive_failures"] == 0 for row in good))
+            identity_bad = False
+            third = multi.collect_accounts(self.config, now + timedelta(minutes=10), session_factory=session_factory, collector=collector)
+        self.assertEqual([row["failed"] for row in third], [0, 0])
+        root = multi.account_directory(self.config, self.account)
+        self.assertEqual(multi.read_json(root / ".collection-health.json")["consecutive_failures"], 0)
+
+    def test_notifier_exception_is_contained_and_backfill_and_other_accounts_continue(self):
+        for account in self.config["ACCOUNTS"]:
+            self.seed_start(account)
+        # Exercise the actual dynamic-import wrapper while replacing its network helper.
+        module = ModuleType("rds_failure_alerts")
+        module.sync_collection_alerts = Mock(side_effect=RuntimeError("PRIVATE-NOTIFICATION-TOKEN"))
+        now = MIDNIGHT + timedelta(minutes=35)
+        bad = True
+
+        def collector(config, account, session, identity, left, right, directory):
+            if bad and account is self.account:
+                raise RuntimeError("mock source failure")
+            return self.snapshot(left, right)
+
+        output = StringIO()
+        with patch.dict(sys.modules, {"rds_failure_alerts": module}), redirect_stdout(output), redirect_stderr(output):
+            first = multi.collect_accounts(self.config, now, session_factory=self.session, collector=collector)
+            self.assertEqual([row["failed"] for row in first], [1, 0])
+            self.assertTrue(all(row["alert_failed"] for row in first))
+            bad = False
+            second = multi.collect_accounts(self.config, now + timedelta(minutes=5), session_factory=self.session, collector=collector)
+        self.assertEqual([row["failed"] for row in second], [0, 0])
+        self.assertTrue(all(row["alert_failed"] for row in second))
+        self.assertNotIn("PRIVATE-NOTIFICATION-TOKEN", output.getvalue())
+        self.assertTrue(multi.build_report(self.config, self.account, DAY, now + timedelta(minutes=5))["complete"])
+
+    def test_invalid_persisted_consecutive_counter_is_recollected_safely(self):
+        self.seed_start()
+        path = self.checkpoint(MIDNIGHT, MIDNIGHT + timedelta(minutes=30))
+        valid = multi.read_json(path)
+        notifier = self.notifications()
+        with patch.object(multi, "dispatch_collection_alerts", notifier):
+            for invalid in (True, -1, "2", None, 1.5):
+                with self.subTest(invalid=invalid):
+                    multi.atomic_json(path, {**valid, "consecutive_failures": invalid})
+                    result = multi.collect_account(self.config, self.account, MIDNIGHT + timedelta(minutes=35),
+                                                   session_factory=self.session,
+                                                   collector=lambda c, a, s, i, left, right, d: self.snapshot(left, right))
+                    self.assertEqual((result["processed"], result["failed"]), (1, 0))
+                    recovered = multi.read_json(path)
+                    self.assertEqual(recovered["consecutive_failures"], 0)
+                    self.assertEqual(recovered["attempts"], 1)
+
+    def test_two_interrupted_workers_are_observed_before_next_retry_and_success_recovers(self):
+        self.seed_start()
+        now = MIDNIGHT + timedelta(minutes=35)
+        notifier = self.notifications()
+        with patch.object(multi, "dispatch_collection_alerts", notifier):
+            with self.assertRaises(SystemExit):
+                multi.collect_account(self.config, self.account, now, session_factory=self.session,
+                                      collector=Mock(side_effect=SystemExit("worker stopped")))
+            path = multi.bucket_path(self.config, self.account, MIDNIGHT)
+            self.assertTrue(multi.read_json(path)["in_progress"])
+            notifier.assert_not_called()
+            with self.assertRaises(SystemExit):
+                multi.collect_account(self.config, self.account, now + timedelta(minutes=5), session_factory=self.session,
+                                      collector=Mock(side_effect=SystemExit("second worker stopped")))
+            self.assertEqual(self.observed_bucket(notifier)["consecutive_failures"], 1)
+            self.assertIn("InterruptedCollection", self.observed_bucket(notifier)["error_types"])
+
+            def recovered(config, account, session, identity, left, right, directory):
+                # The second interruption must reach the notifier before any
+                # third potentially hanging source call is attempted.
+                self.assertEqual(self.observed_bucket(notifier)["consecutive_failures"], 2)
+                self.assertTrue(self.observed_bucket(notifier)["failed"])
+                return self.snapshot(left, right)
+
+            result = multi.collect_account(self.config, self.account, now + timedelta(minutes=10),
+                                           session_factory=self.session, collector=recovered)
+        self.assertEqual(result["failed"], 0)
+        self.assertFalse(self.observed_bucket(notifier)["failed"])
+        self.assertEqual(self.observed_bucket(notifier)["consecutive_failures"], 0)
+        self.assertFalse(multi.read_json(path)["in_progress"])
+        self.assertEqual(multi.read_json(path)["attempts"], 3)
+
+    def test_active_good_snapshot_is_still_marked_incomplete_while_refresh_is_interrupted(self):
+        path = self.checkpoint(MIDNIGHT, MIDNIGHT + timedelta(minutes=30), count=2)
+        state = multi.read_json(path)
+        state["in_progress"] = True
+        multi.atomic_json(path, state)
+        report = multi.build_report(self.config, self.account, DAY, MIDNIGHT + timedelta(minutes=35))
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["actors"][0]["total"], 2)
+
+
+class TaskLockTests(MultiFixture):
+    def clock(self, now):
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+        return patch.object(multi, "datetime", FrozenDatetime)
+
+    def test_active_collection_does_not_block_scheduled_mail_but_defers_retention(self):
+        path = self.configuration_path()
+        root = multi.safe_directory(self.config["OUTPUT_DIRECTORY"])
+        now = MIDNIGHT + timedelta(days=1, hours=9)
+        with self.clock(now), patch.object(multi, "build_report", side_effect=self.simple_report), patch("rds_pdf.render_account_pdf", side_effect=self.fake_pdf), patch("rds_mail.send_reports", return_value={"message_id": "while-collecting"}) as sender, patch.object(multi, "collect_accounts") as collect, patch.object(multi, "prune", return_value=[]) as prune, redirect_stdout(StringIO()):
+            with multi._exclusive(root / ".multi-account.collect.lock") as held:
+                self.assertTrue(held)
+                self.assertEqual(multi.main(["--config", str(path), "--scheduled"]), 0)
+                sender.assert_called_once()
+                prune.assert_not_called()
+                # Another collection must still respect the same-mode lock.
+                self.assertEqual(multi.main(["--config", str(path), "--collect"]), 0)
+                collect.assert_not_called()
+            self.assertEqual(multi.main(["--config", str(path), "--scheduled"]), 0)
+            prune.assert_called()
+            sender.assert_called_once()  # Releasing the lock does not duplicate mail.
+
+    def test_active_delivery_allows_collection_but_prevents_other_delivery_and_retention(self):
+        path = self.configuration_path()
+        root = multi.safe_directory(self.config["OUTPUT_DIRECTORY"])
+        now = MIDNIGHT + timedelta(days=1, hours=9)
+        pruning_seen_by_collection = []
+        with self.clock(now), patch.object(multi, "collect_accounts", return_value=[{"failed": 0}]) as collect, patch.object(multi, "deliver") as deliver, patch.object(multi, "prune", return_value=[]) as prune, redirect_stdout(StringIO()):
+            def collection_work(config, started):
+                pruning_seen_by_collection.append(prune.called)
+                return [{"failed": 0}]
+
+            collect.side_effect = collection_work
+            with multi._exclusive(root / ".multi-account.delivery.lock") as held:
+                self.assertTrue(held)
+                self.assertEqual(multi.main(["--config", str(path), "--collect"]), 0)
+                collect.assert_called_once()
+                prune.assert_not_called()
+                self.assertEqual(multi.main(["--config", str(path), "--scheduled"]), 0)
+                deliver.assert_not_called()
+            self.assertEqual(multi.main(["--config", str(path), "--collect"]), 0)
+            self.assertEqual(collect.call_count, 2)
+            prune.assert_called()
+            self.assertEqual(pruning_seen_by_collection, [False, True])
+
+    def test_expired_data_is_removed_before_collector_is_interrupted(self):
+        self.config["RETENTION_DAYS"] = 3
+        path = self.configuration_path()
+        now = MIDNIGHT + timedelta(days=1, hours=9)
+        today = now.date()
+        expired = multi.day_directory(self.config, self.account, today - timedelta(days=3))
+        (expired / "old-summary.json").write_text("{}", encoding="utf-8")
+        retained = multi.day_directory(self.config, self.account, today - timedelta(days=2))
+
+        def stopped_worker(config, started):
+            self.assertFalse(expired.exists(), "Retention must run before a long source query can be killed")
+            self.assertTrue(retained.exists())
+            raise KeyboardInterrupt("simulate service termination during collection")
+
+        with self.clock(now), patch.object(multi, "collect_accounts", side_effect=stopped_worker), redirect_stdout(StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                multi.main(["--config", str(path), "--collect"])
+        self.assertFalse(expired.exists())
+        self.assertTrue(retained.exists())
+        root = multi.safe_directory(self.config["OUTPUT_DIRECTORY"])
+        with multi._exclusive(root / ".multi-account.collect.lock") as released:
+            self.assertTrue(released)
+
+
 class CombinedDeliveryTests(MultiFixture):
     def test_backfill_sends_initial_incomplete_mail_then_only_one_complete_revision(self):
         sender = Mock(return_value={"message_id": "backfill"})
@@ -472,7 +823,7 @@ class CombinedDeliveryTests(MultiFixture):
             self.assertEqual(multi.main(["--config", str(path), "--scheduled"]), 0)
             self.assertEqual(multi.main(["--config", str(path), "--scheduled"]), 0)
         sender.assert_called_once()
-        self.assertEqual(prune.call_count, 2)
+        prune.assert_called()
         self.assertEqual(prune.call_args.args[1], date(2026, 11, 4))
         aws.assert_not_called()
 
@@ -534,9 +885,20 @@ class CombinedDeliveryTests(MultiFixture):
 
     def test_collect_still_runs_retention_when_one_account_is_partial(self):
         path = self.configuration_path()
-        with patch.object(multi, "collect_accounts", return_value=[{"failed": 1}]), patch.object(multi, "prune", return_value=[]) as prune, redirect_stdout(StringIO()):
+        events = []
+
+        def collection(config, now):
+            events.append("collect")
+            return [{"failed": 1}]
+
+        def pruning(config, today):
+            events.append("prune")
+            return []
+
+        with patch.object(multi, "collect_accounts", side_effect=collection), patch.object(multi, "prune", side_effect=pruning) as prune, redirect_stdout(StringIO()):
             self.assertEqual(multi.main(["--config", str(path), "--collect"]), 2)
-        prune.assert_called_once()
+        prune.assert_called()
+        self.assertLess(events.index("prune"), events.index("collect"))
 
     def test_retention_cleans_removed_accounts_but_keeps_unmarked_data(self):
         self.config["RETENTION_DAYS"] = 3
