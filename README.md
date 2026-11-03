@@ -4,6 +4,8 @@
 
 默认同时采集 7 个账号，每账号每 30 分钟形成一个数据分段，也可配置为 60 分钟；每天北京时间 08:10 发送**昨日 00:00 至今日 00:00**的自然日汇总。不是旧版前日 07:00 至今日 08:00 的 25 小时窗口。并发数、时区、发信时间、采集间隔和本地保留天数都在配置中调整。
 
+**自动邮件默认每天最多 1 封，所有账号合并发送。** 补采、数据变化、完整度变化、修改收件人或升级采集口径都不触发当天第二封自动邮件，也不自动发送修订版；只更新本地 PDF。手动执行带 `--send-mail` 的命令属于额外明确发送，不受自动邮件限额影响。
+
 只统计带**有效来源 IPv4 / IPv6** 的记录，排除空地址、主机名、`AWS Internal` 和本地 socket 来源；支持明确的 IP:端口格式。只保存 IP 汇总、覆盖状态和 PDF，不保存 SQL 原文、业务参数或逐条执行详情。数据库 SQL 与 RDS 管理 API 在 PDF 中分表，避免混成一种次数；同一账号内不同数据库用户的相同来源 IP 合并，AWS 账号之间始终隔离。
 
 无 IP 记录只计入排除数量；带 IP 但 SQL 无法解析/分类的记录、无法读取来源的坏日志仍标记不完整，不能当作没有操作。此次 IP-only 汇总使用新 schema 与采集口径，自动隔离旧的混合来源缓存并重新采集，避免将旧主机名/无来源统计混入。
@@ -29,6 +31,7 @@ chmod 600 rds-audit-config.json
   "RETENTION_DAYS": 7,
   "TIMEZONE": "Asia/Shanghai",
   "DAILY_MAIL_TIME": "08:10",
+  "AUTO_MAIL_MAX_PER_DAY": 1,
   "MAIL_REPORT_MODE": "previous_day",
   "SMTP_HOST": "",
   "SMTP_PORT": 465,
@@ -74,6 +77,7 @@ chmod 600 rds-audit-config.json
 - `MAIL_RECIPIENTS` / `MAIL_CC` 使用邮箱数组，例如 `["audit@example.com", "ops@example.com"]`；CC 可为空。`SMTP_USERNAME` 同时作为发件邮箱。465 默认 SSL；需要 587 STARTTLS 时相应修改端口和 `SMTP_SECURITY`。
 - `NAME` 是目录标签，只支持字母、数字、下划线和连字符；`NAME` 与 `ACCOUNT_ID` 各自不得重复。真正采集前使用 STS 核验 Key 对应的账号，账号不匹配不会采集。
 - `ACCOUNT_CONCURRENCY` 是同时采集账号数，默认 7、范围 1-32；实际并发取该值与启用账号数的较小值。账号总数不受并发数限制，超出的账号自动排队；设为 1 即顺序采集。每个工作线程独立创建 boto3 Session、分页读取、分段和补采状态，不跨账号共享凭据或缓存。
+- `AUTO_MAIL_MAX_PER_DAY` 仅支持 `1`（每天最多一封自动邮件）或 `0`（关闭自动邮件，仅更新本地 PDF）；旧配置没有该字段也默认 `1`。自然日按 `TIMEZONE` 计算。关闭自动邮件时可不填写 SMTP；手动明确发送时仍需完整 SMTP 配置。
 - 每账号支持成对的 Access Key / Secret Key、临时凭据 Token，或 `AWS_PROFILE`；Key 与 profile 不可同时配置。均为空时使用该服务用户的标准 AWS 凭据链。`ENABLED: false` 暂停该账号采集和报告。
 - `OUTPUT_DIRECTORY` 相对**配置文件所在目录**解析，所以默认输出为 `/usr/local/aws-rds-shenji/output/`；也可填写绝对路径。不要指向网页公开目录。
 - 完整示例还包括 `MAX_BUCKETS_PER_ACCOUNT_PER_RUN`（默认 6）、`LOG_DELAY_MINUTES`（默认 5）、`REFRESH_DELAY_MINUTES`（默认 60）和 `PDF_FONT_PATH`（可选中文 TTF 字体）。
@@ -170,7 +174,18 @@ cd /usr/local/aws-rds-shenji
 
 指定今日时，仅统计到经过日志缓冲的最近完整分段；报告窗口在 PDF 中明确显示，不冒充完整全天。指定日期必须仍在保留范围内。定时邮件只发送最近一个昨日，不自动逐日补发停机期间的历史邮件。
 
-SMTP 使用验证证书的 SSL / STARTTLS，To 与 CC 去重，所有账号 PDF 一次提交。服务器接受后记录投递状态，同样内容不重复发送。首次报告不完整时先发一份提示，补采仍不完整期间仅更新本地 PDF，恢复完整后发一份修订；完整报告的迟到数据、账号或收件人改变也会触发修订。明确的连接/认证失败 15 分钟后重试；部分收件人拒收、提交阶段断连或进程在提交期间退出会保留为 `uncertain` / `sending`，不会自动向所有人重发。核实实际投递后才手动加 `--force-resend`（需与 `--report --send-mail` 一起使用）。SMTP 接受不等于每个收件箱最终送达。
+SMTP 使用验证证书的 SSL / STARTTLS，To 与 CC 去重，所有账号 PDF 一次提交。自动邮件在发送前先持久预占当日额度，服务器接受后锁定额度。即使首封数据不完整，后续补采恢复、迟到数据、账号或收件人变化也只更新本地 PDF，不自动再次发送。`.daily-mail-budget.json` 保存按发送自然日计算的限额，按本地保留天数剪枝；升级首次识别已有日报成功回执，将当天视为已发，避免升级后再发一封“修订”。状态损坏不会自动重置额度。
+
+明确的连接/认证失败不消耗成功额度，可按投递状态在 15 分钟后重试；部分收件人拒收、提交阶段断连或进程在提交期间退出会保留为 `uncertain` / `sending`，保守占用额度并停止自动重发。需要再次发送时，应先核实投递状态，再手动执行报表发送命令；必要时显式加 `--force-resend`。自动日报不再带“修订”标题，手动重新投递仍可标记修订。SMTP 接受不等于每个收件箱最终送达。
+
+若出现自动邮件重复，先停止邮件调度而保留数据采集：
+
+```bash
+systemctl disable --now aws-rds-audit.timer
+systemctl stop aws-rds-audit.service
+```
+
+更新到包含每日限额的版本后，再运行 `systemctl enable --now aws-rds-audit.timer` 恢复自动邮件。不要删除投递回执或每日限额文件来“重置”，否则会失去已发送证据。
 
 ```bash
 journalctl -u aws-rds-audit-collect.service -n 100 --no-pager
