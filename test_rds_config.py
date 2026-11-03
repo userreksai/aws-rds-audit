@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from rds_config import load_config, strip_json_comments, validate_mail_config
+from rds_config import DEFAULTS, load_config, strip_json_comments, validate_mail_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -31,6 +31,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["PDF_FONT_PATH"], str((self.path.parent / "fonts/chinese.ttf").resolve()))
         self.assertEqual(result["COLLECTION_INTERVAL_MINUTES"], 30)
         self.assertEqual(result["ACCOUNT_CONCURRENCY"], 7)
+        self.assertEqual(result["AUTO_MAIL_MAX_PER_DAY"], 1)
         self.assertEqual(result["RETENTION_DAYS"], 7)
         self.assertEqual(result["MAIL_REPORT_MODE"], "previous_day")
         self.assertEqual(result["SMTP_PORT"], 465)
@@ -49,6 +50,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([account["ACCOUNT_ID"] for account in result["ACCOUNTS"]],
                          [f"{number:012d}" for number in range(1, 8)])
         self.assertEqual(result["ACCOUNT_CONCURRENCY"], 7)
+        self.assertEqual(result["AUTO_MAIL_MAX_PER_DAY"], 1)
+        documented = json.loads(strip_json_comments(example.read_text(encoding="utf-8")))
+        self.assertEqual(set(documented), set(DEFAULTS) | {"ACCOUNTS"})
         self.assertIn("//", example.read_text(encoding="utf-8"))
         for account in result["ACCOUNTS"]:
             for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
@@ -123,6 +127,16 @@ class ConfigTests(unittest.TestCase):
             result = self.load({**settings, "ACCOUNT_CONCURRENCY": concurrency})
             self.assertEqual(len(result["ACCOUNTS"]), 10)
             self.assertEqual(result["ACCOUNT_CONCURRENCY"], concurrency)
+
+    def test_auto_mail_daily_limit_defaults_to_one_and_accepts_only_zero_or_one_integers(self):
+        # Existing private JSON files need no edit to get the one-mail default.
+        self.assertEqual(self.load()["AUTO_MAIL_MAX_PER_DAY"], 1)
+        for value in (0, 1):
+            with self.subTest(value=value):
+                self.assertEqual(self.load({**self.base, "AUTO_MAIL_MAX_PER_DAY": value})["AUTO_MAIL_MAX_PER_DAY"], value)
+        for value in (False, True, -1, 2, 0.0, 1.0, "1", None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "AUTO_MAIL_MAX_PER_DAY"):
+                self.load({**self.base, "AUTO_MAIL_MAX_PER_DAY": value})
 
     def test_comments_preserve_urls_literals_escaped_quotes_and_backslashes(self):
         expected = {

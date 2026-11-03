@@ -459,7 +459,7 @@ def _delivery_path(config, day):
     return day_directory(config, account, day) / "combined-mail.json"
 
 
-def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt_path=None, label=None):
+def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt_path=None, label=None, automatic=False):
     from rds_mail import MailDeliveryError, send_reports
 
     receipt_path = Path(receipt_path) if receipt_path is not None else _delivery_path(config, day)
@@ -512,7 +512,7 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
     try:
         result = (sender or send_reports)(config, attachments, body,
                                          subject=config["MAIL_SUBJECT"] + " " + label
-                                         + (" [修订]" if previous.get("status") == "accepted" else "")
+                                         + (" [修订]" if previous.get("status") == "accepted" and not automatic else "")
                                          + ("" if complete else " [数据不完整]"))
         status.update(status="accepted", smtp_accepted=True, message_id=result.get("message_id"))
     except MailDeliveryError as exc:
@@ -523,6 +523,52 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
     atomic_json(receipt_path, status)
     print(f"合并邮件 {label}：{status['status']}，PDF {len(attachments)} 份。")
     return status
+
+
+def daily_receipts(config, day):
+    """Find previous daily submissions across our account trees, excluding manual runs."""
+    receipts = []
+    root = Path(config["OUTPUT_DIRECTORY"])
+    for directory in root.iterdir():
+        if not directory.is_dir() or _is_link(directory):
+            continue
+        marker = directory / ".rds-audit-account"
+        if not marker.is_file() or _is_link(marker):
+            continue
+        owner = read_json(marker)
+        if not isinstance(owner, dict) or directory.name != str(owner.get("account_name", "")) + "-" + str(owner.get("account_id", "")):
+            continue
+        day_path = directory / day.isoformat()
+        if not day_path.is_dir() or _is_link(day_path):
+            continue
+        path = day_path / "combined-mail.json"
+        if path.exists():
+            if _is_link(path):
+                raise ValueError("日报投递状态不可为链接")
+            value = read_json(path)
+            if not isinstance(value, dict):
+                raise ValueError("日报投递状态格式异常")
+            receipts.append(value)
+    return receipts
+
+
+def deliver_automatic(config, day, now):
+    from rds_daily_mail import automatic_daily_mail
+
+    result = automatic_daily_mail(config, day, now,
+        build_reports=lambda: [build_report(config, account, day, now)
+                               for account in config["ACCOUNTS"] if account["ENABLED"]],
+        render_reports=lambda reports: _render_reports(config, reports),
+        deliver_callback=lambda reports: deliver(config, day, now, reports=reports, automatic=True),
+        receipts=lambda: daily_receipts(config, day),
+        state_path=Path(config["OUTPUT_DIRECTORY"]) / ".daily-mail-budget.json")
+    if result["status"] in {"suppressed", "disabled"}:
+        print("自动日报本轮未发邮件：" + ("已达到每日一封上限；补采只更新本地PDF。" if result["status"] == "suppressed"
+                                             else "自动邮件已关闭；仅更新本地PDF。"))
+    elif result["status"] in {"uncertain", "sending", "failed"}:
+        print(f"自动邮件状态：{result['status']}（{result.get('reason', 'delivery_status')}）；"
+              "按投递状态保留限额，不确定投递不会自动重发。", flush=True)
+    return result
 
 
 def prune(config, today):
@@ -603,9 +649,14 @@ def main(argv=None):
             raise ValueError("--send-mail/--force-resend 仅可用于 --report 或 --since-yesterday")
         if args.force_resend and not args.send_mail:
             raise ValueError("--force-resend 需要 --send-mail")
-        config = load_config(args.config, require_mail=args.check_config or args.scheduled or args.send_mail)
+        config = load_config(args.config, require_mail=False)
+        if args.send_mail or ((args.check_config or args.scheduled) and config.get("AUTO_MAIL_MAX_PER_DAY", 1) > 0):
+            config = load_config(args.config, require_mail=True)
         if args.check_config:
-            print("配置结构与 SMTP 字段检查通过；尚未连接 AWS 或邮件服务器。")
+            if config.get("LARK_ALERTS_ENABLED") and not config.get("LARK_WEBHOOK_URL"):
+                raise ValueError("启用异常群通知时必须填写 LARK_WEBHOOK_URL")
+            print("配置结构检查通过；" + ("自动邮件已关闭。" if not config.get("AUTO_MAIL_MAX_PER_DAY", 1)
+                                                else "SMTP字段检查通过。") + "尚未连接 AWS 或邮件服务器。")
             return 0
         if args.verify_accounts:
             failures = 0
@@ -686,8 +737,11 @@ def main(argv=None):
             elif args.scheduled:
                 day = scheduled_day(config, now)
                 if day is not None:
-                    status = deliver(config, day, now)
-                    result = (0 if status["complete"] else 2) if status["status"] == "accepted" else 3
+                    status = deliver_automatic(config, day, now)
+                    if status["status"] in {"suppressed", "disabled"}:
+                        result = 0
+                    else:
+                        result = (0 if status["complete"] else 2) if status["status"] == "accepted" else 3
             else:
                 day = args.date or today - timedelta(days=1)
                 if day < today - timedelta(days=config["RETENTION_DAYS"] - 1):

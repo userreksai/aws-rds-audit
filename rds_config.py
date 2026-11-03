@@ -21,6 +21,7 @@ DEFAULTS = {
     "RETENTION_DAYS": 7,
     "TIMEZONE": "Asia/Shanghai",
     "DAILY_MAIL_TIME": "08:10",
+    "AUTO_MAIL_MAX_PER_DAY": 1,
     "MAIL_REPORT_MODE": "previous_day",
     "MAIL_SUBJECT": "AW-RDS审计报告",
     "MAIL_SENDER_NAME": "",
@@ -256,6 +257,7 @@ def load_config(path, require_mail=False):
     if result["COLLECTION_INTERVAL_MINUTES"] not in (30, 60):
         raise ValueError("COLLECTION_INTERVAL_MINUTES 必须为 30 或 60")
     _integer(result["ACCOUNT_CONCURRENCY"], "ACCOUNT_CONCURRENCY", maximum=32)
+    _integer(result["AUTO_MAIL_MAX_PER_DAY"], "AUTO_MAIL_MAX_PER_DAY", minimum=0, maximum=1)
     # Yesterday must survive until its scheduled morning PDF/mail is produced.
     _integer(result["RETENTION_DAYS"], "RETENTION_DAYS", minimum=2)
     _integer(result["MAX_BUCKETS_PER_ACCOUNT_PER_RUN"], "MAX_BUCKETS_PER_ACCOUNT_PER_RUN")
