@@ -14,6 +14,8 @@ credentials
 .env.*
 lark-config.json
 rds-audit-config.json
+rds-audit-config.jsonc
+rds-audit-config.full.jsonc
 output/
 tmp/
 

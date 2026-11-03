@@ -51,7 +51,7 @@ id "$RUN_USER" >/dev/null 2>&1 || fail "服务用户不存在：$RUN_USER"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 [[ "$RUN_HOME" == /* && -d "$RUN_HOME" ]] || fail '服务用户必须有已存在的绝对 HOME 目录。'
-for name in rds_multi.py rds_config.py rds_summary.py rds_report.py rds_mail.py rds_pdf.py requirements.txt deploy/render_mail_units.py; do
+for name in rds_multi.py rds_config.py rds_summary.py rds_report.py rds_mail.py rds_pdf.py rds_failure_alerts.py lark_notify.py requirements.txt deploy/render_mail_units.py; do
   [[ -f "$PROJECT_ROOT/$name" ]] || fail "项目缺少文件：$name，请下载完整项目。"
 done
 [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] || fail "配置必须是普通文件且不能是符号链接：$CONFIG_PATH；请先复制并填写 rds-audit-config.example.json。"

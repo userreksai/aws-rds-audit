@@ -1,44 +1,137 @@
+// 复制为 rds-audit-config.json 后填写；配置含密钥，请 chmod 600，勿提交到 Git。
+// 文件支持 // 行注释和 /* 块注释 */；字符串仍用双引号，最后一项不要加逗号。
 {
+  // 数据、分段汇总和 PDF 的保存目录；相对路径从本配置所在目录计算。
   "OUTPUT_DIRECTORY": "output",
+  // 单账号按 30 或 60 分钟分段采集；每段结束后经过下方日志缓冲才处理。
   "COLLECTION_INTERVAL_MINUTES": 30,
+  // 同时采集的账号数量，范围 1-32；实际并发取该值和已启用账号数的较小值。
+  "ACCOUNT_CONCURRENCY": 7,
+  // 含今日共保留几日，最少 2；设置 3 即保留今日、昨日、前日，旧日期自动清理。
   "RETENTION_DAYS": 7,
+  // 日界线、文件归档日期和每日邮件时间所用时区；默认北京时间。
   "TIMEZONE": "Asia/Shanghai",
+  // 每天发送前一自然日汇总的当地时间，格式 HH:MM。
   "DAILY_MAIL_TIME": "08:10",
+  // 目前固定 previous_day，即昨日 00:00 到今日 00:00，不是旧版 25 小时窗口。
   "MAIL_REPORT_MODE": "previous_day",
+  // 每账号每轮最多处理的分段数；较多账号首次回填时可结合 API 限额调整。
   "MAX_BUCKETS_PER_ACCOUNT_PER_RUN": 6,
+  // 分段结束后等待日志发布的分钟数，允许 0。
   "LOG_DELAY_MINUTES": 5,
+  // 成功分段结束多久后再补读一次迟到日志，单位分钟，允许 0。
   "REFRESH_DELAY_MINUTES": 60,
+
+  // 是否向异常群发送采集失败告警；新配置默认开启，旧版无此字段则保持关闭。
+  "LARK_ALERTS_ENABLED": true,
+  // 填写 Lark 或飞书群机器人的完整 HTTPS Webhook；开启告警时安装前必须填写。
+  "LARK_WEBHOOK_URL": "",
+  // 机器人开启签名校验时填写签名密钥，否则留空。
+  "LARK_SIGNING_SECRET": "",
+  // 连续失败几次后告警，最少 2；默认首次采集失败且再次补采仍失败时告警。
+  "LARK_ALERT_AFTER_FAILURES": 2,
+  // 同一持续故障重复提醒间隔，单位分钟，必须大于 0。
+  "LARK_ALERT_REPEAT_MINUTES": 60,
+  // Lark 通知本身失败后的重试间隔，单位分钟，必须大于 0。
+  "LARK_NOTIFICATION_RETRY_MINUTES": 5,
+
+  // 可选中文 TTF/TTC 字体路径；留空则自动选择系统字体或标准中文字体。
   "PDF_FONT_PATH": "",
+  // 邮件服务器域名或地址，由你填写；不要包含协议前缀或端口。
   "SMTP_HOST": "",
+  // SMTP 端口，默认 465；使用 STARTTLS 时按服务商要求填写（通常 587）。
   "SMTP_PORT": 465,
+  // 完整发件邮箱地址，同时作为 SMTP 登录账号。
   "SMTP_USERNAME": "",
+  // SMTP 授权码或密码，由你填写；不写入报告、通知和日志。
   "SMTP_AUTH_CODE": "",
+  // 传输加密方式：ssl 或 starttls，不支持明文连接。
   "SMTP_SECURITY": "ssl",
+  // SMTP 连接及读写超时秒数，大于 0 且不超过 600。
   "SMTP_TIMEOUT": 30,
+  // 收件邮箱数组，至少填写一个；例如按 ["邮箱一", "邮箱二"] 格式填写真实地址。
   "MAIL_RECIPIENTS": [],
+  // 抄送邮箱数组，无抄送则保持 []。
   "MAIL_CC": [],
+  // 邮件标题前缀；发送时自动加报表日期及必要的修订/不完整标记。
   "MAIL_SUBJECT": "AW-RDS审计报告",
+  // 邮件中显示的发件人名称，由你填写，可留空。
   "MAIL_SENDER_NAME": "",
+
+  // 当前预留 7 个账号，后续可继续复制账号对象增加，账号总数不受 7 限制。
+  // NAME 和 ACCOUNT_ID 各自必须唯一；请把占位 ID 替换为真实 12 位 AWS 账号 ID。
+  // 使用 Key 时成对填写 ID/Secret，临时凭据同时填 Token，并保持 AWS_PROFILE 为空。
+  // 使用本机 profile 时只填 AWS_PROFILE，Key/Secret/Token 留空；都为空则使用默认凭据链。
   "ACCOUNTS": [
     {
-      "NAME": "account-a",
-      "ACCOUNT_ID": "000000000001",
-      "ENABLED": true,
-      "AWS_ACCESS_KEY_ID": "",
-      "AWS_SECRET_ACCESS_KEY": "",
-      "AWS_SESSION_TOKEN": "",
-      "AWS_PROFILE": "",
-      "REGIONS": "all"
+      "NAME": "account-1", // 账号 1 的目录短名，仅使用字母、数字、下划线和连字符。
+      "ACCOUNT_ID": "000000000001", // 替换为账号 1 的真实 12 位 ID，采集前核验 Key 归属。
+      "ENABLED": true, // false 暂停此账号采集与邮件附件。
+      "AWS_ACCESS_KEY_ID": "", // 填写账号 1 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 填写账号 1 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 仅临时凭据需要填写，其余留空。
+      "AWS_PROFILE": "", // 可选本机 profile 名，不能和上方 Key 同时填写。
+      "REGIONS": "all" // all 为已启用区域，也可填写区域数组或逗号分隔字符串。
     },
     {
-      "NAME": "account-b",
-      "ACCOUNT_ID": "000000000002",
-      "ENABLED": true,
-      "AWS_ACCESS_KEY_ID": "",
-      "AWS_SECRET_ACCESS_KEY": "",
-      "AWS_SESSION_TOKEN": "",
-      "AWS_PROFILE": "",
-      "REGIONS": "all"
+      "NAME": "account-2", // 账号 2 的唯一目录短名。
+      "ACCOUNT_ID": "000000000002", // 替换为账号 2 的真实 12 位 ID。
+      "ENABLED": true, // false 暂停账号 2。
+      "AWS_ACCESS_KEY_ID": "", // 账号 2 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 账号 2 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 可选临时凭据 Token。
+      "AWS_PROFILE": "", // 可选本机 profile 名，使用 Key 时留空。
+      "REGIONS": "all" // 本账号需要采集的区域。
+    },
+    {
+      "NAME": "account-3", // 账号 3 的唯一目录短名。
+      "ACCOUNT_ID": "000000000003", // 替换为账号 3 的真实 12 位 ID。
+      "ENABLED": true, // false 暂停账号 3。
+      "AWS_ACCESS_KEY_ID": "", // 账号 3 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 账号 3 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 可选临时凭据 Token。
+      "AWS_PROFILE": "", // 可选本机 profile 名，使用 Key 时留空。
+      "REGIONS": "all" // 本账号需要采集的区域。
+    },
+    {
+      "NAME": "account-4", // 账号 4 的唯一目录短名。
+      "ACCOUNT_ID": "000000000004", // 替换为账号 4 的真实 12 位 ID。
+      "ENABLED": true, // false 暂停账号 4。
+      "AWS_ACCESS_KEY_ID": "", // 账号 4 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 账号 4 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 可选临时凭据 Token。
+      "AWS_PROFILE": "", // 可选本机 profile 名，使用 Key 时留空。
+      "REGIONS": "all" // 本账号需要采集的区域。
+    },
+    {
+      "NAME": "account-5", // 账号 5 的唯一目录短名。
+      "ACCOUNT_ID": "000000000005", // 替换为账号 5 的真实 12 位 ID。
+      "ENABLED": true, // false 暂停账号 5。
+      "AWS_ACCESS_KEY_ID": "", // 账号 5 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 账号 5 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 可选临时凭据 Token。
+      "AWS_PROFILE": "", // 可选本机 profile 名，使用 Key 时留空。
+      "REGIONS": "all" // 本账号需要采集的区域。
+    },
+    {
+      "NAME": "account-6", // 账号 6 的唯一目录短名。
+      "ACCOUNT_ID": "000000000006", // 替换为账号 6 的真实 12 位 ID。
+      "ENABLED": true, // false 暂停账号 6。
+      "AWS_ACCESS_KEY_ID": "", // 账号 6 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 账号 6 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 可选临时凭据 Token。
+      "AWS_PROFILE": "", // 可选本机 profile 名，使用 Key 时留空。
+      "REGIONS": "all" // 本账号需要采集的区域。
+    },
+    {
+      "NAME": "account-7", // 账号 7 的唯一目录短名；新增账号继续复制这一对象。
+      "ACCOUNT_ID": "000000000007", // 替换为账号 7 的真实 12 位 ID。
+      "ENABLED": true, // false 暂停账号 7。
+      "AWS_ACCESS_KEY_ID": "", // 账号 7 的 Access Key ID。
+      "AWS_SECRET_ACCESS_KEY": "", // 账号 7 对应的 Secret Access Key。
+      "AWS_SESSION_TOKEN": "", // 可选临时凭据 Token。
+      "AWS_PROFILE": "", // 可选本机 profile 名，使用 Key 时留空。
+      "REGIONS": "all" // 本账号需要采集的区域。
     }
   ]
 }

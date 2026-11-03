@@ -226,7 +226,8 @@ class Collector:
             return function()
         except Exception as exc:
             check.update(status="error", error_type=type(exc).__name__, message=str(exc))
-            print(f"[部分失败] {scope}: {exc}", file=sys.stderr)
+            if not getattr(self.args, "quiet", False):
+                print(f"[部分失败] {scope}: {exc}", file=sys.stderr)
             return None
 
     def collect_items(self, scope, client, operation, result_key, **kwargs):
@@ -403,7 +404,8 @@ class Collector:
                     "scope": f"{region}:classify_sql:{name}", "status": "error", "error_type": "UnclassifiedSqlRecords",
                     "message": f"{counts['quarantined_record_count']} 条审计记录无法可靠分类，已仅保存问题计数；未计入增删改。",
                 })
-            print(f"{region}: {name} 已读取候选事件 {counts['received_event_count']} 条，汇总增删改 {counts['change_record_count']} 条；不保存日志正文。", flush=True)
+            if not getattr(self.args, "quiet", False):
+                print(f"{region}: {name} 已读取候选事件 {counts['received_event_count']} 条，汇总增删改 {counts['change_record_count']} 条；不保存日志正文。", flush=True)
 
     def run(self):
         from rds_summary import SummaryAccumulator
@@ -432,7 +434,8 @@ class Collector:
                     self.report["checks"].append({"scope": "summary_quality", "status": "error", "error_type": "UnclassifiedSqlRecords", "message": "部分记录无法可靠解析或去重，仅保存问题计数，未冒充完整汇总。"})
         except Exception as exc:
             self.report["checks"].append({"scope": "collection", "status": "error", "error_type": type(exc).__name__, "message": str(exc)})
-            print(f"[部分失败] 采集未完成: {exc}", file=sys.stderr)
+            if not getattr(self.args, "quiet", False):
+                print(f"[部分失败] 采集未完成: {exc}", file=sys.stderr)
         finally:
             self.accumulator = None
             self.report["finished_at"] = iso(datetime.now(UTC))
