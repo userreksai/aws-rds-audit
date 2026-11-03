@@ -12,6 +12,7 @@ import hashlib
 import ipaddress
 import json
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 
@@ -19,6 +20,9 @@ CATEGORIES = ("新增", "删除", "修改", "其他操作")
 COVERAGE_FIELDS = ("audit_cloudwatch_events", "general_log_events_not_counted",
                    "duplicate_cloudwatch_events", "filtered_management", "filtered_queries",
                    "filtered_auxiliary", "unclassified", "unparsed_records")
+IP_COVERAGE_FIELDS = ("filtered_no_ip_records", "source_unreadable_records")
+IP_AUXILIARY_OPERATIONS = frozenset({"CONNECT", "DISCONNECT", "FAILED_CONNECT", "CHANGEUSER",
+                                     "READ", "WRITE", "CREATE", "ALTER", "RENAME", "DROP"})
 REASONS = {"parse_sql", "unclassified_sql", "invalid_record_indexes", "missing_event_id",
            "parse_management", "parse_jsonl", "read_jsonl", "quarantine_sql", "missing_segments"}
 
@@ -34,8 +38,12 @@ def _number(value):
     return value
 
 
-def _empty_coverage():
-    return {**dict.fromkeys(COVERAGE_FIELDS, 0), "unknown_reasons": {}}
+def _coverage_fields(dimension):
+    return COVERAGE_FIELDS + IP_COVERAGE_FIELDS if dimension == "ip" else COVERAGE_FIELDS
+
+
+def _empty_coverage(dimension="user"):
+    return {**dict.fromkeys(_coverage_fields(dimension), 0), "unknown_reasons": {}}
 
 
 def _dimension(value):
@@ -45,7 +53,45 @@ def _dimension(value):
 
 
 def _summary_format(dimension):
-    return {"schema_version": 2, "dimension": "ip"} if dimension == "ip" else {"schema_version": 1}
+    return {"schema_version": 3, "dimension": "ip"} if dimension == "ip" else {"schema_version": 1}
+
+
+def canonical_source_ip(value):
+    """Return a literal IP, optionally extracted from an unambiguous endpoint.
+
+    DNS names, internal service labels and scoped interface names are excluded.
+    IPv6 without brackets is always interpreted as an address, never guessed to
+    contain a port. Bracketed IPv6 and IPv4:port accept only ports 0-65535.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or "%" in value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    bracketed = re.fullmatch(r"\[([^\[\]]+)\](?::([0-9]+))?", value)
+    if bracketed:
+        host, port = bracketed.groups()
+        version = 6
+    elif value.count(":") == 1:
+        host, port = value.split(":", 1)
+        version = 4
+    else:
+        return None
+    if port is not None:
+        if not re.fullmatch(r"[0-9]+", port):
+            return None
+        significant = port.lstrip("0") or "0"
+        if len(significant) > 5 or int(significant) > 65535:
+            return None
+    try:
+        address = ipaddress.ip_address(host)
+        return str(address) if address.version == version and "%" not in host else None
+    except ValueError:
+        return None
 
 
 def _actor(row, dimension="user"):
@@ -55,17 +101,11 @@ def _actor(row, dimension="user"):
     if not isinstance(row["actor"], str) or not isinstance(row["actor_key"], str):
         raise ValueError("summary actor names and keys must be strings")
     if dimension == "ip":
-        source = row.get("source_ip", "")
-        if not isinstance(source, str):
-            raise ValueError("summary source_ip must be a string")
-        source = source.strip()
-        try:
-            source = str(ipaddress.ip_address(source))
-            actor_type = "来源 IP"
-        except ValueError:
-            actor_type = "来源主机" if source else "未知来源"
-        return {"actor": source or "未知来源", "actor_key": kind + ":source_ip:" + source,
-                "actor_type": actor_type, "source_kind": kind, "source_ip": source,
+        source = canonical_source_ip(row.get("source_ip"))
+        if source is None:
+            raise ValueError("IP operation summaries require a valid literal source IP")
+        return {"actor": source, "actor_key": kind + ":source_ip:" + source,
+                "actor_type": "来源 IP", "source_kind": kind, "source_ip": source,
                 "total": 0, "failed": 0, "counts": dict.fromkeys(CATEGORIES, 0),
                 "attempted_counts": dict.fromkeys(CATEGORIES, 0)}
     key = "sql:username:" + str(row["actor"]) if kind == "sql" else str(row["actor_key"])
@@ -102,7 +142,7 @@ class SummaryAccumulator:
         self.db.execute("PRAGMA cache_size=-4096")
         self.db.execute("CREATE TABLE identities (kind TEXT, identity BLOB, PRIMARY KEY(kind,identity)) WITHOUT ROWID")
         self.actors = {}
-        self.coverage = _empty_coverage()
+        self.coverage = _empty_coverage(self.dimension)
         self.unknown = Counter()
         self.operations = 0
 
@@ -152,6 +192,14 @@ class SummaryAccumulator:
             # CloudTrail EventID is global, including cross-Region duplicates.
             if not self._remember("management", row["event_id"]):
                 return result
+            if self.dimension == "ip":
+                source_ip = canonical_source_ip(row["source_ip"])
+                if source_ip is None:
+                    self.coverage["filtered_no_ip_records"] += 1
+                    self.coverage["filtered_management"] += 1
+                    result["filtered_management"] = 1
+                    return result
+                row["source_ip"] = source_ip
             if row["category"] not in _model().CHANGE_CATEGORIES:
                 self.coverage["filtered_management"] += 1
                 result["filtered_management"] = 1
@@ -216,8 +264,39 @@ class SummaryAccumulator:
         for index, segment in zip(indexes, segments):
             if not self._remember("sql_record", self._sql_key(envelope, index)):
                 continue
+            source_ip = None
+            if self.dimension == "ip":
+                # Scope must be established from the CSV header before reading
+                # SQL, return codes or timestamp variants. A known non-IP source
+                # cannot make this IP-only report incomplete. An unreadable
+                # header is retained as a quality issue, never guessed away.
+                try:
+                    header, _ = model._read_prefix(segment.strip())
+                    source_ip = canonical_source_ip(header[3])
+                except (ValueError, TypeError, IndexError):
+                    self.coverage["source_unreadable_records"] += 1
+                    self._unknown("parse_sql")
+                    result["unknown_records"] += 1
+                    continue
+                if source_ip is None:
+                    self.coverage["filtered_no_ip_records"] += 1
+                    continue
+                # TABLE/connection records are not SQL statements. Their
+                # documented forms may omit retcode; do not invent a return
+                # code merely to exclude them from statement counts.
+                operation = header[6].strip().upper()
+                if operation in IP_AUXILIARY_OPERATIONS:
+                    self.coverage["filtered_auxiliary"] += 1
+                    result["auxiliary_records"] += 1
+                    continue
+                if operation != "QUERY" and not operation.startswith("QUERY_"):
+                    self._unknown("parse_sql")
+                    result["unknown_records"] += 1
+                    continue
             try:
                 row = model.parse_audit_record(segment, envelope, index)
+                if source_ip is not None:
+                    row["source_ip"] = source_ip
                 disposition = model.row_disposition(row)
                 if disposition == "change":
                     self._add_row(row)
@@ -254,10 +333,10 @@ def merge_summaries(payloads, start, end, dimension="user"):
     start, end = model.timestamp(start), model.timestamp(end)
     if start >= end:
         raise ValueError("summary start must precede end")
-    actors, coverage, unknown = {}, _empty_coverage(), Counter()
+    actors, coverage, unknown = {}, _empty_coverage(dimension), Counter()
     windows, complete = [], True
     for payload in payloads:
-        expected_version = 2 if dimension == "ip" else 1
+        expected_version = 3 if dimension == "ip" else 1
         if (type(payload.get("schema_version")) is not int or payload["schema_version"] != expected_version or
                 payload.get("summary_only") is not True or
                 (dimension == "ip" and payload.get("dimension") != "ip") or
@@ -286,8 +365,11 @@ def merge_summaries(payloads, start, end, dimension="user"):
             for category in CATEGORIES:
                 target["counts"][category] += counts[category]
                 target["attempted_counts"][category] += attempted[category]
-        for field in COVERAGE_FIELDS:
+        for field in _coverage_fields(dimension):
             coverage[field] += _number(payload.get("coverage", {}).get(field, 0))
+        if (dimension == "ip" and payload["coverage"].get("source_unreadable_records", 0)
+                > payload["coverage"].get("unparsed_records", 0)):
+            raise ValueError("unreadable source count exceeds unresolved records")
         for reason, count in payload.get("coverage", {}).get("unknown_reasons", {}).items():
             unknown[reason if reason in REASONS else "quarantine_sql"] += _number(count)
         if sum(payload.get("coverage", {}).get("unknown_reasons", {}).values()) != payload.get("coverage", {}).get("unparsed_records", 0):

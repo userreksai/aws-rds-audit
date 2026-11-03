@@ -39,7 +39,7 @@ class IpSummaryTests(unittest.TestCase):
             sql_event(user="app3", sql="DELETE FROM private_table", event_id="three", code=1142),
             sql_event(source="192.0.2.23", sql="DELETE FROM private_table", event_id="four"),
         ])
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         self.assertEqual(payload["dimension"], "ip")
         self.assertEqual(len(payload["actors"]), 2)
         row = payload["actors"][0]
@@ -80,18 +80,15 @@ class IpSummaryTests(unittest.TestCase):
         self.assertEqual([(row["source_ip"], row["total"]) for row in payload["actors"]],
                          [("2001:db8::1", 2), ("192.0.2.22", 1)])
 
-    def test_hostname_and_unknown_source_are_marked_without_inventing_ip(self):
+    def test_hostname_and_unknown_source_are_excluded_from_ip_scope(self):
         payload = self.summarize([
             sql_event(source="proxy.internal", event_id="host"),
             sql_event(source="", event_id="empty"),
             sql_event(source="未知来源", event_id="literal-host"),
         ])
-        self.assertEqual(len(payload["actors"]), 3)
-        rows = {row["source_ip"]: row for row in payload["actors"]}
-        self.assertEqual(rows["proxy.internal"]["actor_type"], "来源主机")
-        self.assertEqual(rows[""]["actor"], "未知来源")
-        self.assertEqual(rows[""]["actor_type"], "未知来源")
-        self.assertNotEqual(rows[""]["actor_key"], rows["未知来源"]["actor_key"])
+        self.assertEqual(payload["actors"], [])
+        self.assertEqual(payload["coverage"]["filtered_no_ip_records"], 3)
+        self.assertTrue(payload["complete"])
 
     def test_duplicate_multirecord_event_is_counted_once_per_record(self):
         first = sql_event(event_id="batch", sql="INSERT INTO t VALUES(1)")

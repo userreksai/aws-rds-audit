@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from rds_pdf import render_account_pdf
+from rds_pdf import FRESH_LOG_NOTE, render_account_pdf
 
 
 def account_report(account="123456789012", rows=2):
@@ -78,6 +78,58 @@ class PdfTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             render_account_pdf(account_report(), self.directory / "invalid.pdf", str(self.directory / "missing.ttf"))
         self.assertFalse((self.directory / "invalid.pdf").exists())
+
+    def test_yesterday_to_now_range_has_explicit_label_real_window_and_fixed_delay_note(self):
+        report = account_report()
+        report.update(report_kind="since_yesterday", date="2026-11-03",
+                      generated_at="2026-11-03T05:17:29Z",
+                      fresh_log_note="DO-NOT-RENDER SQL-ERROR-CONTENT")
+        report["window"] = {"start_inclusive": "2026-11-01T16:00:00Z",
+                            "end_exclusive": "2026-11-03T05:17:29Z"}
+        path = render_account_pdf(report, self.directory / "yesterday-to-now.pdf")
+        _, text = self.extract(path)
+        self.assertIn("昨日到当前", text)
+        self.assertIn("截止日期 2026-11-03", text)
+        self.assertIn("2026-11-02 00:00:00", text)
+        self.assertIn("2026-11-03 13:17:29", text)
+        self.assertIn(FRESH_LOG_NOTE, text)
+        self.assertNotIn("DO-NOT-RENDER", text)
+        self.assertNotIn("MUST-NOT-RENDER", text)
+        self.assertNotIn("AUTH-CODE-SECRET", text)
+
+    def test_yesterday_to_now_keeps_incomplete_status_and_ordinary_daily_pdf_unchanged(self):
+        report = account_report()
+        report.update(report_kind="since_yesterday", complete=False,
+                      errors=[{"message": "UNSAFE-PROVIDER-TEXT"}])
+        _, ranged_text = self.extract(render_account_pdf(report, self.directory / "range-incomplete.pdf"))
+        self.assertIn("采集或解析不完整", ranged_text)
+        self.assertNotIn("UNSAFE-PROVIDER-TEXT", ranged_text)
+        _, daily_text = self.extract(render_account_pdf(account_report(), self.directory / "daily.pdf"))
+        self.assertIn("AWS RDS 来源 IP 审计汇总", daily_text)
+        self.assertIn("报表日期 2026-11-03", daily_text)
+        self.assertNotIn("昨日到当前", daily_text)
+        self.assertNotIn(FRESH_LOG_NOTE, daily_text)
+        self.assertNotIn("仅统计有效来源", daily_text)
+
+    def test_ip_only_scope_explains_filtered_sources_and_keeps_quality_failure(self):
+        for selector in ({"schema_version": 3}, {"scope": {"source_filter": "ip_only"}}):
+            with self.subTest(selector=selector):
+                report = account_report()
+                report.update(selector)
+                report.update(report_kind="since_yesterday", complete=False,
+                              coverage={"unparsed_records": 2, "filtered_no_ip_records": 17,
+                                        "source_unreadable_records": 2},
+                              errors=[{"message": "DO-NOT-RENDER-PROVIDER-ERROR"}])
+                path = render_account_pdf(report, self.directory / "ip-only.pdf")
+                _, text = self.extract(path)
+                self.assertIn("仅统计有效来源 IPv4/IPv6", text)
+                self.assertIn("无 IP 已排除 17 条", text)
+                self.assertIn("无法读取来源 2 条仍属质量问题", text)
+                self.assertNotIn("来源 IP / 主机", text)
+                self.assertNotIn("非 IP 主机名及未知来源单独标识", text)
+                self.assertIn("采集或解析不完整", text)
+                self.assertIn("未解析 / 未分类记录 2 条", text)
+                self.assertNotIn("DO-NOT-RENDER", text)
 
 
 if __name__ == "__main__":

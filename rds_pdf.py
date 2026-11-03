@@ -25,6 +25,7 @@ MUTED = colors.HexColor("#526477")
 PALE = colors.HexColor("#EDF3F9")
 LINE = colors.HexColor("#D6E0EB")
 CATEGORIES = ("新增", "删除", "修改", "其他操作")
+FRESH_LOG_NOTE = "统计截至本次执行开始时刻已发布的日志；最近发生的操作可能因日志发布延迟而尚未计入。"
 
 
 def _font(font_path):
@@ -89,6 +90,8 @@ def render_account_pdf(report: dict, path: Path, font_path: str | None = None) -
     p = lambda value, style="body": Paragraph(_text(value), styles[style])
     account = str(report.get("account_id", "未验证账号"))
     account_name = str(report.get("account_name", ""))
+    since_yesterday = report.get("report_kind") == "since_yesterday"
+    ip_only = report.get("schema_version") == 3 or (report.get("scope") or {}).get("source_filter") == "ip_only"
     zone = str(report.get("timezone", "Asia/Shanghai"))
     window = report.get("window") or {}
     complete = report.get("complete") is True
@@ -113,9 +116,11 @@ def render_account_pdf(report: dict, path: Path, font_path: str | None = None) -
     totals = {key: sum(row["counts"][key] for row in sql_rows) for key in CATEGORIES}
     failed = sum(row["failed"] for row in sql_rows)
     total = sum(row["total"] for row in sql_rows)
-    story = [p("AWS RDS 来源 IP 审计汇总", "title"),
+    title = "AWS RDS 昨日到当前 IP 审计汇总" if since_yesterday else "AWS RDS 来源 IP 审计汇总"
+    date_label = "截止日期" if since_yesterday else "报表日期"
+    story = [p(title, "title"),
              p(f"账号 {account}  |  {account_name}" if account_name else f"账号 {account}", "sub"),
-             p(f"报表日期 {report.get('date', '')}  |  时区 {zone}", "sub"),
+             p(f"{date_label} {report.get('date', '')}  |  时区 {zone}", "sub"),
              p(f"查询窗口 {_local_time(window.get('start_inclusive'), zone)} 至 {_local_time(window.get('end_exclusive'), zone)}（左闭右开）", "sub"),
              Spacer(1, 5 * mm)]
     status_table = Table([[p(status)]], colWidths=[263 * mm])
@@ -141,7 +146,7 @@ def render_account_pdf(report: dict, path: Path, font_path: str | None = None) -
             story.append(p("本窗口未取得可计数记录。请结合日志启用情况、保留期、采集状态及覆盖范围判断，不能直接认定没有操作。", "note"))
             continue
         include_other = any(row["counts"]["其他操作"] for row in rows)
-        labels = ["来源 IP / 主机", "新增", "删除", "修改", "失败"]
+        labels = ["来源 IP" if ip_only else "来源 IP / 主机", "新增", "删除", "修改", "失败"]
         if include_other:
             labels.append("其他")
         labels.append("合计")
@@ -171,8 +176,17 @@ def render_account_pdf(report: dict, path: Path, font_path: str | None = None) -
     story.extend([p("统计口径与覆盖", "section"),
                   p(f"未解析 / 未分类记录 {unknown:,} 条；采集与覆盖问题 {error_count:,} 项。失败请求单列，不计入未报错的增删改。", "note"),
                   p("新增、删除、修改按审计语句或 API 请求条数计数，不等于受影响行数。SQL 返回码 0 不证明事务最终提交；API 未报错不证明异步变更最终完成。", "note"),
-                  p("来源为数据库或 AWS 实际观测到的地址；代理、连接池或 NAT 可能使来源显示为应用 / 代理地址。非 IP 主机名及未知来源单独标识。管理 API 和数据库 SQL 分开汇总。", "note"),
+                  p("来源为数据库或 AWS 实际观测到的地址；代理、连接池或 NAT 可能使来源显示为应用 / 代理地址。"
+                    + ("无有效来源 IP 的记录不纳入操作次数。" if ip_only else "非 IP 主机名及未知来源单独标识。")
+                    + "管理 API 和数据库 SQL 分开汇总。", "note"),
                   p("仅包含当时已启用且仍在保留期内、当前身份有权读取的记录。日志延迟、用户过滤、截断、缺段或权限失败可能造成不完整；没有记录不等于没有操作。", "note")])
+    if ip_only:
+        filtered_no_ip = _number(coverage.get("filtered_no_ip_records", 0))
+        unreadable_source = _number(coverage.get("source_unreadable_records", 0))
+        story.append(p(f"仅统计有效来源 IPv4/IPv6；无 IP 已排除 {filtered_no_ip:,} 条；无法读取来源 {unreadable_source:,} 条仍属质量问题。", "note"))
+    if since_yesterday:
+        # This note is fixed product text, never an arbitrary SQL/provider field.
+        story.append(p(FRESH_LOG_NOTE, "note"))
     if report.get("demo"):
         story.insert(0, p("离线演示 - 所有账号、IP 与统计均为虚构", "sub"))
     generated = _local_time(report.get("generated_at"), zone)
