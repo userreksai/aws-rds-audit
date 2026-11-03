@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time as process_time
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -101,7 +103,7 @@ def windows(day, zone, minutes):
 
 
 def scope_for(config, account):
-    return {"version": 1, "dimension": "ip", "account_id": account["ACCOUNT_ID"],
+    return {"version": 2, "dimension": "ip", "source_filter": "ip_only", "account_id": account["ACCOUNT_ID"],
             "regions": account["REGIONS"], "timezone": config["TIMEZONE"],
             "interval_minutes": config["COLLECTION_INTERVAL_MINUTES"]}
 
@@ -215,7 +217,8 @@ def dispatch_collection_alerts(config, account, root, observations, now):
     try:
         from rds_failure_alerts import sync_collection_alerts
 
-        return sync_collection_alerts(config, account, root / ".lark-state.json", observations, now)
+        return sync_collection_alerts(config, account, root / ".lark-state.json", observations, now,
+                                      collection_scope=scope_id(config, account))
     except Exception as exc:
         print(f"账号 {account['ACCOUNT_ID']}：Lark异常通知待重试（{type(exc).__name__}）。", file=sys.stderr)
         return {"sent": 0, "pending": 1, "failed": 1}
@@ -318,6 +321,12 @@ def collect_account(config, account, now, *, session_factory=create_session, col
                      next_retry=0 if succeeded else int(now.timestamp()) + min(3600, 300 * 2 ** min(consecutive - 1, 4)))
         atomic_json(path, state)
         observations[iso(start)] = bucket_observation(config, account, state, start, end)
+        if not succeeded:
+            coverage = ((state.get("active") or {}).get("summary") or {}).get("coverage", {})
+            kinds = sorted({str(error.get("error_type", "CollectionError")) for error in errors})
+            print(f"账号 {account['ACCOUNT_ID']} 分段 {iso(start)} 至 {iso(end)} 不完整："
+                  f"{','.join(kinds)}；未解析/未分类 {coverage.get('unparsed_records', 0)} 条；"
+                  f"已排除无IP {coverage.get('filtered_no_ip_records', 0)} 条。", flush=True)
         done += 1
         failed += not succeeded
     result = {"processed": done, "failed": failed, "remaining": max(0, len(pending + refresh) - done)}
@@ -356,6 +365,8 @@ def _collect_one_account(config, account, now, kwargs):
     except Exception as exc:
         result.update(failed=max(1, result["failed"]), storage_error_type=type(exc).__name__)
     print(f"账号 {account['NAME']} ({account['ACCOUNT_ID']})：采集 {result['processed']} 段，失败 {result['failed']}。")
+    if result.get("error_type") or result.get("storage_error_type"):
+        print(f"账号 {account['ACCOUNT_ID']}：{result.get('error_type') or result.get('storage_error_type')}。", flush=True)
     return {"account_id": account["ACCOUNT_ID"], **result}
 
 
@@ -422,11 +433,23 @@ def _render_reports(config, reports):
     for report in reports:
         account = accounts[report["account_id"]]
         directory = day_directory(config, account, date.fromisoformat(report["date"]))
-        pdf = directory / f"{account['NAME']}-{account['ACCOUNT_ID']}-{report['date']}-RDS-IP审计.pdf"
+        tag = report.get("artifact_tag")
+        if tag:
+            directory = manual_directory(config, account, date.fromisoformat(report["date"]), tag)
+        suffix = "-" + tag if tag else ""
+        pdf = directory / f"{account['NAME']}-{account['ACCOUNT_ID']}-{report['date']}{suffix}-RDS-IP审计.pdf"
         render_account_pdf(report, pdf, font_path=config.get("PDF_FONT_PATH") or None)
         atomic_json(directory / "ip-report.json", report)
         attachments.append(pdf)
     return attachments
+
+
+def manual_directory(config, account, day, tag):
+    import re
+
+    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", tag):
+        raise ValueError("手动报告标识无效")
+    return safe_directory(day_directory(config, account, day) / "manual" / tag)
 
 
 def _delivery_path(config, day):
@@ -436,16 +459,18 @@ def _delivery_path(config, day):
     return day_directory(config, account, day) / "combined-mail.json"
 
 
-def deliver(config, day, now, *, force=False, sender=None):
+def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt_path=None, label=None):
     from rds_mail import MailDeliveryError, send_reports
 
-    receipt_path = _delivery_path(config, day)
+    receipt_path = Path(receipt_path) if receipt_path is not None else _delivery_path(config, day)
+    label = label or day.isoformat()
     previous = read_json(receipt_path) if receipt_path.exists() else {}
     if not force and previous.get("status") in {"sending", "uncertain"}:
         return previous
     if not force and previous.get("next_retry", 0) > now.timestamp():
         return previous
-    reports = [build_report(config, account, day, now) for account in config["ACCOUNTS"] if account["ENABLED"]]
+    if reports is None:
+        reports = [build_report(config, account, day, now) for account in config["ACCOUNTS"] if account["ENABLED"]]
     complete = all(report["complete"] for report in reports)
     # Account order, generation time and credential rotation do not create a new
     # delivery; changed counts/coverage/accounts/recipients do create a revision.
@@ -468,18 +493,25 @@ def deliver(config, day, now, *, force=False, sender=None):
             atomic_json(receipt_path, previous)
         return previous
     attachments = _render_reports(config, reports)
-    body = f"{day.isoformat()} RDS 来源 IP 审计汇总，共 {len(reports)} 个账号。\n"
+    body = f"{label} RDS 来源 IP 审计汇总，共 {len(reports)} 个账号。\n"
+    if reports and reports[0].get("report_kind") == "since_yesterday":
+        window = reports[0]["window"]
+        zone = ZoneInfo(config["TIMEZONE"])
+        local_start = datetime.fromisoformat(window["start_inclusive"].replace("Z", "+00:00")).astimezone(zone)
+        local_end = datetime.fromisoformat(window["end_exclusive"].replace("Z", "+00:00")).astimezone(zone)
+        body += f"窗口：{local_start:%Y-%m-%d %H:%M:%S} 至 {local_end:%Y-%m-%d %H:%M:%S}（{config['TIMEZONE']}，左闭右开）。\n"
+        body += "仅统计有效来源IPv4/IPv6；统计截至本次采集开始时刻已发布的日志，最近日志可能延迟到达。\n"
     body += "\n".join(f"{report['account_name']} ({report['account_id']})："
                       + ("采集步骤完整" if report["complete"] else "数据不完整，请核查缺段/日志/权限") for report in reports)
     body += "\n\n附件按账号分别生成。SQL 语句次数与 AWS 管理 API 调用分开统计；不是影响行数或最终事务提交数。"
-    status = {"date": day.isoformat(), "at": iso(now), "status": "sending", "complete": complete,
+    status = {"date": day.isoformat(), "label": label, "at": iso(now), "status": "sending", "complete": complete,
               "account_ids": sorted(report["account_id"] for report in reports), "fingerprint": fingerprint,
               "delivery_key": delivery_key,
               "attempts": int(previous.get("attempts", 0)) + 1}
     atomic_json(receipt_path, status)  # Crash after SMTP acceptance must not trigger blind duplicates.
     try:
         result = (sender or send_reports)(config, attachments, body,
-                                         subject=config["MAIL_SUBJECT"] + " " + day.isoformat()
+                                         subject=config["MAIL_SUBJECT"] + " " + label
                                          + (" [修订]" if previous.get("status") == "accepted" else "")
                                          + ("" if complete else " [数据不完整]"))
         status.update(status="accepted", smtp_accepted=True, message_id=result.get("message_id"))
@@ -489,7 +521,7 @@ def deliver(config, day, now, *, force=False, sender=None):
     except Exception as exc:
         status.update(status="uncertain", error_type=type(exc).__name__)
     atomic_json(receipt_path, status)
-    print(f"合并邮件 {day.isoformat()}：{status['status']}，PDF {len(attachments)} 份。")
+    print(f"合并邮件 {label}：{status['status']}，PDF {len(attachments)} 份。")
     return status
 
 
@@ -531,6 +563,25 @@ def prune_when_idle(config, today, other_lock):
                 print("已清理过期日期目录：" + item)
 
 
+@contextmanager
+def task_lock(path, wait_seconds=0):
+    deadline = process_time.monotonic() + wait_seconds
+    announced = False
+    while True:
+        with _exclusive(path) as acquired:
+            if acquired:
+                yield True
+                return
+        remaining = deadline - process_time.monotonic()
+        if remaining <= 0:
+            yield False
+            return
+        if not announced:
+            print("等待正在运行的任务完成，再执行本次报告。", flush=True)
+            announced = True
+        process_time.sleep(min(2, remaining))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=PROJECT / "rds-audit-config.json")
@@ -540,13 +591,16 @@ def main(argv=None):
     mode.add_argument("--collect", action="store_true")
     mode.add_argument("--scheduled", action="store_true")
     mode.add_argument("--report", action="store_true")
+    mode.add_argument("--since-yesterday", action="store_true", help="直接采集昨日00:00到本次开始时刻，生成跨日PDF")
     parser.add_argument("--date", type=date.fromisoformat)
     parser.add_argument("--send-mail", action="store_true")
     parser.add_argument("--force-resend", action="store_true", help="仅人工核实投递后显式重发")
     args = parser.parse_args(argv)
     try:
-        if (args.date or args.send_mail or args.force_resend) and not args.report:
-            raise ValueError("--date/--send-mail/--force-resend 仅可用于 --report")
+        if args.date and not args.report:
+            raise ValueError("--date 仅可用于 --report")
+        if (args.send_mail or args.force_resend) and not (args.report or args.since_yesterday):
+            raise ValueError("--send-mail/--force-resend 仅可用于 --report 或 --since-yesterday")
         if args.force_resend and not args.send_mail:
             raise ValueError("--force-resend 需要 --send-mail")
         config = load_config(args.config, require_mail=args.check_config or args.scheduled or args.send_mail)
@@ -565,12 +619,12 @@ def main(argv=None):
                         print(f"账号 {account['ACCOUNT_ID']}：预检失败（{type(exc).__name__}），检查身份、权限、区域和 audit 日志。", file=sys.stderr)
             return 2 if failures else 0
         root = safe_directory(config["OUTPUT_DIRECTORY"])
-        mode = "collect" if args.collect else "delivery"
-        other = "delivery" if args.collect else "collect"
-        with _exclusive(root / (".multi-account." + mode + ".lock")) as acquired:
+        mode = "collect" if args.collect or args.since_yesterday else "delivery"
+        other = "delivery" if args.collect or args.since_yesterday else "collect"
+        with task_lock(root / (".multi-account." + mode + ".lock"), wait_seconds=600 if args.since_yesterday else 0) as acquired:
             if not acquired:
                 print("已有同类多账号任务运行，等待下一轮。")
-                return 0
+                return 1 if args.since_yesterday else 0
             now = datetime.now(UTC)
             today = now.astimezone(ZoneInfo(config["TIMEZONE"])).date()
             if args.date and (args.date > today or args.date < today - timedelta(days=config["RETENTION_DAYS"] - 1)):
@@ -601,6 +655,34 @@ def main(argv=None):
                 prune_when_idle(config, today, root / (".multi-account." + other + ".lock"))
                 results = collect_accounts(config, now)
                 result = 2 if any(item["failed"] or item.get("alert_failed") or item.get("alert_pending") for item in results) else 0
+            elif args.since_yesterday:
+                from rds_window import collect_since_yesterday, window_identity
+
+                start, end, tag = window_identity(config, now)
+                print(f"直接采集昨日到当前：{iso(start)} 至 {iso(end)}（UTC），仅统计有效来源IP。", flush=True)
+                reports = collect_since_yesterday(config, now, session_factory=create_session,
+                    identity_checker=check_identity, collector=collect_bucket,
+                    directory_factory=lambda account, artifact_tag: manual_directory(config, account, today, artifact_tag))
+                for report in reports:
+                    print(f"账号 {report['account_id']}：{'采集步骤完整' if report['complete'] else '采集或解析不完整'}；"
+                          f"未解析/未分类 {report['coverage'].get('unparsed_records', 0)} 条；"
+                          f"已排除无IP {report['coverage'].get('filtered_no_ip_records', 0)} 条。", flush=True)
+                if args.send_mail:
+                    account = min((item for item in config["ACCOUNTS"] if item["ENABLED"]), key=lambda item: item["ACCOUNT_ID"])
+                    receipt = manual_directory(config, account, today, tag) / "combined-mail.json"
+                    with task_lock(root / ".multi-account.delivery.lock", wait_seconds=120) as delivery_ready:
+                        if not delivery_ready:
+                            _render_reports(config, reports)
+                            print("邮件任务仍忙，本次PDF已保存，尚未提交邮件。", file=sys.stderr)
+                            return 3
+                        status = deliver(config, today, now, reports=reports, receipt_path=receipt,
+                                         label="昨日到当前 " + end.astimezone(ZoneInfo(config["TIMEZONE"])).strftime("%Y-%m-%d %H:%M:%S"),
+                                         force=args.force_resend)
+                        result = (0 if status["complete"] else 2) if status["status"] == "accepted" else 3
+                else:
+                    attachments = _render_reports(config, reports)
+                    print("PDF 已生成：\n" + "\n".join(str(path) for path in attachments))
+                    result = 0 if all(report["complete"] for report in reports) else 2
             elif args.scheduled:
                 day = scheduled_day(config, now)
                 if day is not None:

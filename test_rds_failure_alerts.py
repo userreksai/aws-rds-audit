@@ -40,10 +40,11 @@ class CollectionFailureAlertTests(unittest.TestCase):
             item["bucket_end"] = end
         return item
 
-    def sync(self, observations=(), *, minutes=0, sender=None, config=None):
+    def sync(self, observations=(), *, minutes=0, sender=None, config=None, collection_scope=None):
         return sync_collection_alerts(self.config if config is None else config, self.account, self.state,
                                       list(observations), self.now + timedelta(minutes=minutes),
-                                      sender=self.sender if sender is None else sender)
+                                      sender=self.sender if sender is None else sender,
+                                      collection_scope=collection_scope)
 
     def assert_stats(self, result, sent=0, pending=0, failed=0):
         self.assertEqual({key: result[key] for key in ("sent", "pending", "failed")},
@@ -164,6 +165,85 @@ class CollectionFailureAlertTests(unittest.TestCase):
         self.assertNotIn("DO-NOT-PERSIST", text)
         self.assertNotIn("SQL TEXT", text)
         self.assertIn("AccessDeniedException", text)
+
+    def test_scope_migration_discards_old_pending_failure_reminder_and_recovery(self):
+        for old_scope in (None, "old-v2-scope"):
+            for phase in ("pending_failure", "reminder", "pending_recovery"):
+                with self.subTest(old_scope=old_scope, phase=phase):
+                    self.state.unlink(missing_ok=True)
+                    self.sender.reset_mock()
+                    self.sender.side_effect = None
+                    if phase == "pending_failure":
+                        self.sender.side_effect = RuntimeError("unavailable")
+                        self.assert_stats(self.sync([self.observation()], collection_scope=old_scope), pending=1, failed=1)
+                    else:
+                        self.assert_stats(self.sync([self.observation()], collection_scope=old_scope), sent=1)
+                        if phase == "pending_recovery":
+                            self.sender.side_effect = RuntimeError("unavailable")
+                            self.assert_stats(self.sync([self.observation(failed=False)], minutes=1,
+                                                       collection_scope=old_scope), pending=1, failed=1)
+                    if old_scope is None:
+                        # Simulate a file from before the collection_scope field
+                        # existed, not merely a newly-written null field.
+                        legacy = json.loads(self.state.read_text(encoding="utf-8"))
+                        legacy.pop("collection_scope", None)
+                        self.state.write_text(json.dumps(legacy), encoding="utf-8")
+                    self.sender.reset_mock()
+                    self.sender.side_effect = None
+                    self.assert_stats(self.sync(minutes=61, collection_scope="literal-ip-v3-scope"))
+                    self.sender.assert_not_called()
+                    migrated = json.loads(self.state.read_text(encoding="utf-8"))
+                    self.assertEqual(migrated["collection_scope"], "literal-ip-v3-scope")
+                    self.assertEqual(migrated["incidents"], {})
+                    self.assertEqual(migrated["account_id"], self.account["ACCOUNT_ID"])
+
+    def test_new_scope_establishes_its_own_first_and_second_failure(self):
+        self.assert_stats(self.sync([self.observation(failures=9, attempts=9)], collection_scope="old-scope"), sent=1)
+        self.sender.reset_mock()
+        self.assert_stats(self.sync([self.observation(failures=1, attempts=1)], minutes=1,
+                                   collection_scope="new-scope"))
+        self.sender.assert_not_called()
+        item = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["incidents"].values()))
+        self.assertFalse(item["open"])
+        self.assertEqual(item["consecutive_failures"], 1)
+        self.assert_stats(self.sync([self.observation(failures=2, attempts=2)], minutes=2,
+                                   collection_scope="new-scope"), sent=1)
+        self.sender.assert_called_once()
+        self.assertNotIn("recover", self.kind(self.sender.call_args))
+
+    def test_same_scope_preserves_pending_retry_and_event_identity_across_rounds(self):
+        self.sender.side_effect = OSError("unavailable")
+        self.assert_stats(self.sync([self.observation()], collection_scope="same-scope"), pending=1, failed=1)
+        event_id = self.sender.call_args.args[0]["event_id"]
+        self.sender.side_effect = None
+        self.assert_stats(self.sync(minutes=4, collection_scope="same-scope"), pending=1)
+        self.assertEqual(self.sender.call_count, 1)
+        self.assert_stats(self.sync(minutes=5, collection_scope="same-scope"), sent=1)
+        self.assertEqual(self.sender.call_args.args[0]["event_id"], event_id)
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8"))["collection_scope"], "same-scope")
+
+    def test_legacy_call_without_scope_does_not_erase_a_previously_bound_scope(self):
+        self.assert_stats(self.sync([self.observation(failures=1, attempts=1)], collection_scope="bound-scope"))
+        self.assert_stats(self.sync([self.observation()], minutes=1), sent=1)
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8"))["collection_scope"], "bound-scope")
+
+    def test_same_scope_does_not_override_account_isolation(self):
+        self.assert_stats(self.sync([self.observation()], collection_scope="same-scope"), sent=1)
+        self.sender.reset_mock()
+        other = {**self.account, "ACCOUNT_ID": "210987654321", "NAME": "other"}
+        result = sync_collection_alerts(self.config, other, self.state, [], self.now + timedelta(minutes=61),
+                                         sender=self.sender, collection_scope="same-scope")
+        self.assert_stats(result)
+        self.sender.assert_not_called()
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["account_id"], other["ACCOUNT_ID"])
+        self.assertEqual(state["collection_scope"], "same-scope")
+        self.assertEqual(state["incidents"], {})
+        result = sync_collection_alerts(self.config, other, self.state, [self.observation(failures=1, attempts=1)],
+                                         self.now + timedelta(minutes=62), sender=self.sender,
+                                         collection_scope="same-scope")
+        self.assert_stats(result)
+        self.sender.assert_not_called()
 
 
 if __name__ == "__main__":

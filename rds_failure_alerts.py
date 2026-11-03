@@ -58,16 +58,21 @@ def _queue(item, kind, account_id):
 
 
 def sync_collection_alerts(config, account, state_path: Path, observations: list[dict],
-                           now: datetime, sender=None) -> dict:
+                           now: datetime, sender=None, collection_scope=None) -> dict:
     """Send at most one failure and one recovery digest for this account/round.
 
     Missing observations do not mean recovery. Only a healthy observation can
     close an incident. Pending counts exclude already-delivered active incidents.
+    When supplied, collection_scope binds incidents to that collection policy.
+    A scope migration discards old incidents without notifying recovery; the new
+    policy must establish its own observed failures. Legacy callers can omit it.
     """
     if not config.get("LARK_ALERTS_ENABLED", False):
         return {"sent": 0, "pending": 0, "failed": 0}
     if now.tzinfo is None:
         raise ValueError("Alert time must include a timezone")
+    if collection_scope is not None and not isinstance(collection_scope, str):
+        raise ValueError("Collection scope must be a string or None")
     path = Path(state_path)
     try:
         previous = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -78,6 +83,12 @@ def sync_collection_alerts(config, account, state_path: Path, observations: list
     except (OSError, ValueError, TypeError):
         previous = {}
     incidents = previous.get("incidents", {})
+    if collection_scope and previous.get("collection_scope") != collection_scope:
+        # Old buckets can fall outside the new policy (for example after moving
+        # from hostname-inclusive to literal-IP-only scope). Their absence is
+        # not recovery, and must not keep producing reminders or pending sends.
+        incidents = {}
+    effective_scope = collection_scope or previous.get("collection_scope")
     zone = ZoneInfo(config.get("TIMEZONE", "Asia/Shanghai"))
     cutoff = now.astimezone(zone).date() - timedelta(days=config.get("RETENTION_DAYS", 7) - 1)
     # Raw observation keys never enter the state or the webhook message.
@@ -130,7 +141,8 @@ def sync_collection_alerts(config, account, state_path: Path, observations: list
         if (item.get("open") and item.get("failed") and not item.get("pending")
                 and now.timestamp() - _integer(item.get("last_failure_sent")) >= repeat_seconds):
             _queue(item, "failure", account_id)
-    state = {"schema_version": 1, "account_id": account_id, "incidents": incidents}
+    state = {"schema_version": 1, "account_id": account_id,
+             "collection_scope": effective_scope, "incidents": incidents}
     _save(path, state)
     statistics = {"sent": 0, "pending": 0, "failed": 0}
     for kind in ("failure", "recovery"):

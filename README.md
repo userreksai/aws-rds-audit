@@ -4,7 +4,9 @@
 
 默认同时采集 7 个账号，每账号每 30 分钟形成一个数据分段，也可配置为 60 分钟；每天北京时间 08:10 发送**昨日 00:00 至今日 00:00**的自然日汇总。不是旧版前日 07:00 至今日 08:00 的 25 小时窗口。并发数、时区、发信时间、采集间隔和本地保留天数都在配置中调整。
 
-只保存来源 IP 汇总、覆盖状态和 PDF，不保存 SQL 原文、业务参数或逐条执行详情。数据库 SQL 与 RDS 管理 API 在 PDF 中分表，避免混成一种次数；同一账号内不同数据库用户的相同来源 IP 合并，AWS 账号之间始终隔离。
+只统计带**有效来源 IPv4 / IPv6** 的记录，排除空地址、主机名、`AWS Internal` 和本地 socket 来源；支持明确的 IP:端口格式。只保存 IP 汇总、覆盖状态和 PDF，不保存 SQL 原文、业务参数或逐条执行详情。数据库 SQL 与 RDS 管理 API 在 PDF 中分表，避免混成一种次数；同一账号内不同数据库用户的相同来源 IP 合并，AWS 账号之间始终隔离。
+
+无 IP 记录只计入排除数量；带 IP 但 SQL 无法解析/分类的记录、无法读取来源的坏日志仍标记不完整，不能当作没有操作。此次 IP-only 汇总使用新 schema 与采集口径，自动隔离旧的混合来源缓存并重新采集，避免将旧主机名/无来源统计混入。
 
 ## 配置
 
@@ -155,6 +157,17 @@ sudo bash install.sh --config ./rds-audit-config.json --user root --no-enable
 .venv/bin/python rds_multi.py --config rds-audit-config.json --report --date 2026-11-03 --send-mail
 ```
 
+需要立即查询**昨日 00:00 到本次采集开始时刻**并发送一次邮件时，使用跨日命令：
+
+```bash
+cd /usr/local/aws-rds-shenji
+.venv/bin/python rds_multi.py --config ./rds-audit-config.json --since-yesterday --send-mail
+```
+
+该命令按配置时区确定昨日零点，所有账号使用同一个毫秒截止时间，直接分页查询整个跨日窗口，不受后台每轮 6 段上限限制，也不以已有零散缓存冒充完整窗口。按 `ACCOUNT_CONCURRENCY` 并发采集；若后台采集正在运行，最多等待 10 分钟后获取采集锁。每账号一份 PDF，所有启用账号作为同一封邮件的附件。去掉 `--send-mail` 仅生成 PDF。
+
+跨日 PDF 明确显示“昨日到当前”和实际起止时间；最新日志可能延迟发布，结果仅代表截止本次开始时刻已能查询到的记录。`--date` 仍仅用于单自然日报告，不能与 `--since-yesterday` 混用。跨日文件、JSON 和投递状态写入截止日的 `manual/since-yesterday-<UTC截止时间>/`，不覆盖每日 PDF 或日报投递凭据，并随该日期目录一起过期。
+
 指定今日时，仅统计到经过日志缓冲的最近完整分段；报告窗口在 PDF 中明确显示，不冒充完整全天。指定日期必须仍在保留范围内。定时邮件只发送最近一个昨日，不自动逐日补发停机期间的历史邮件。
 
 SMTP 使用验证证书的 SSL / STARTTLS，To 与 CC 去重，所有账号 PDF 一次提交。服务器接受后记录投递状态，同样内容不重复发送。首次报告不完整时先发一份提示，补采仍不完整期间仅更新本地 PDF，恢复完整后发一份修订；完整报告的迟到数据、账号或收件人改变也会触发修订。明确的连接/认证失败 15 分钟后重试；部分收件人拒收、提交阶段断连或进程在提交期间退出会保留为 `uncertain` / `sending`，不会自动向所有人重发。核实实际投递后才手动加 `--force-resend`（需与 `--report --send-mail` 一起使用）。SMTP 接受不等于每个收件箱最终送达。
@@ -167,9 +180,11 @@ journalctl -u aws-rds-audit.service -n 100 --no-pager
 
 退出码：0 请求步骤完成；1 配置/启动失败；2 采集或报告不完整；3 邮件失败、等待重试或需要核实投递。示例测试使用虚构数据和模拟 AWS/SMTP，不读取真实 Key、不发真实邮件。
 
+systemd 将退出码 2 显示为 `2/INVALIDARGUMENT`，在本程序中通常意味着覆盖或解析不完整，并不能单凭该标签认定参数有误。新版失败日志会显示分段窗口、安全错误类型、未解析数量与无 IP 排除数量；`UnclassifiedSqlRecords` 表示存在无法可靠解析/分类的审计记录，不表示这些 SQL 在数据库内执行失败。
+
 ## 统计边界
 
-- 数据库 audit 的 `host` 是数据库观测到的来源，可能是应用、连接池、NAT 或代理地址；主机名与未知来源单独标记。不能据此保证识别真实人员或终端 IP。[AWS 审计字段](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Auditing.html)
+- 数据库 audit 的 `host` 是数据库观测到的来源，可能是应用、连接池、NAT 或代理地址；仅有效 IP 纳入汇总。不能据此保证识别真实人员或终端 IP。[AWS 审计字段](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Auditing.html)
 - 新增、删除、修改是可可靠分类的审计**语句次数**；一条 UPDATE 影响一万行仍计一次。保留既有 DDL、REPLACE、LOAD DATA 等分类；SELECT、连接和 TABLE 辅助记录不重复计入。失败单列，返回码 0 不证明事务最终 COMMIT。
 - CloudTrail 来源 IP 用于 AWS 管理 API 调用审计，不能替代数据库内部 SQL；两种来源在 PDF 中分开。[CloudTrail 字段](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html)
 - 日志当时未启用、过滤、截断、过期、权限失败和延迟均可能造成缺失。本程序无法补出未记录的数据，也不会用 general 日志或性能采样冒充完整增删改审计。
