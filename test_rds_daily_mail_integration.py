@@ -64,6 +64,27 @@ class ScheduledDailyMailIntegrationTests(MultiFixture):
                 for left, right in multi.windows(day, ZoneInfo(self.config["TIMEZONE"]), 60):
                     self.checkpoint(left, right, account=account, count=1)
 
+    def test_automatic_subject_uses_beijing_sending_day_and_body_keeps_data_window(self):
+        self.config["TIMEZONE"] = "Asia/Shanghai"
+        day = date(2026, 11, 3)
+        now = datetime(2026, 11, 4, 0, 10, tzinfo=UTC)
+        self.seed_complete_day(day=day)
+        self.assertEqual(self.run_main(now), 0)
+        message = self.smtp.send_message.call_args.args[0]
+        self.assertEqual(str(message["Subject"]), "AW-RDS审计报告 2026-11-04")
+        body = message.get_body(preferencelist=("plain",)).get_content()
+        self.assertIn("2026-11-03 00:00:00 至 2026-11-04 00:00:00（Asia/Shanghai", body)
+        self.assertNotIn("影响行数", body)
+        self.assertNotIn("最终事务提交数", body)
+        self.assertTrue(all("2026-11-03-RDS-IP审计.pdf" in part.get_filename()
+                            for part in message.iter_attachments()))
+        receipt = multi.read_json(multi._delivery_path(self.config, day))
+        self.assertEqual(receipt["date"], "2026-11-03")
+        self.assertEqual(receipt["label"], "2026-11-04")
+        self.assertEqual(self.budget()["entries"]["2026-11-04"]["report_day"], "2026-11-03")
+        self.assertEqual(self.run_main(now + timedelta(minutes=5)), 0)
+        self.smtp.send_message.assert_called_once()
+
     def test_every_five_minutes_changes_never_send_a_second_automatic_revision(self):
         self.seed_one()
         self.assertEqual(self.run_main(), 2)  # Initial partial report is explicitly marked.
@@ -123,6 +144,9 @@ class ScheduledDailyMailIntegrationTests(MultiFixture):
         self.assertTrue(all(entry["used"] == 1 for entry in self.budget()["entries"].values()))
         self.assertTrue(all("修订" not in str(call.args[0]["Subject"])
                             for call in self.smtp.send_message.call_args_list))
+        self.assertEqual([str(call.args[0]["Subject"]) for call in self.smtp.send_message.call_args_list],
+                         ["AW-RDS审计报告 2026-11-03 [数据不完整]",
+                          "AW-RDS审计报告 2026-11-04 [数据不完整]"])
 
     def test_upgrade_imports_accepted_receipt_from_previous_first_disabled_account(self):
         old_directory = multi.day_directory(self.config, self.account, REPORT_DAY)

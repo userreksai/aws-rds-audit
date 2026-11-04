@@ -809,6 +809,10 @@ class CombinedDeliveryTests(MultiFixture):
             self.assertIn(account["ACCOUNT_ID"].encode(), path.read_bytes())
         self.assertIn("2 个账号", sender.call_args.args[2])
         self.assertNotIn("PRIVATE", sender.call_args.args[2])
+        self.assertEqual(sender.call_args.kwargs["subject"], "AW-RDS审计报告 2026-11-03")
+        self.assertIn("2026-11-03 00:00:00 至 2026-11-04 00:00:00（UTC", sender.call_args.args[2])
+        self.assertNotIn("影响行数", sender.call_args.args[2])
+        self.assertNotIn("最终事务提交数", sender.call_args.args[2])
 
     def test_repeated_scheduled_wake_does_not_resend_accepted_mail_and_runs_retention(self):
         path = self.configuration_path()

@@ -463,7 +463,10 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
     from rds_mail import MailDeliveryError, send_reports
 
     receipt_path = Path(receipt_path) if receipt_path is not None else _delivery_path(config, day)
-    label = label or day.isoformat()
+    # Automatic subjects name the sending day; report paths and receipts retain
+    # the data day. Explicit historical/range reports keep their own labels.
+    label = label or (now.astimezone(ZoneInfo(config["TIMEZONE"])).date().isoformat()
+                      if automatic else day.isoformat())
     previous = read_json(receipt_path) if receipt_path.exists() else {}
     if not force and previous.get("status") in {"sending", "uncertain"}:
         return previous
@@ -494,16 +497,17 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
         return previous
     attachments = _render_reports(config, reports)
     body = f"{label} RDS 来源 IP 审计汇总，共 {len(reports)} 个账号。\n"
-    if reports and reports[0].get("report_kind") == "since_yesterday":
+    if reports:
         window = reports[0]["window"]
         zone = ZoneInfo(config["TIMEZONE"])
         local_start = datetime.fromisoformat(window["start_inclusive"].replace("Z", "+00:00")).astimezone(zone)
         local_end = datetime.fromisoformat(window["end_exclusive"].replace("Z", "+00:00")).astimezone(zone)
         body += f"窗口：{local_start:%Y-%m-%d %H:%M:%S} 至 {local_end:%Y-%m-%d %H:%M:%S}（{config['TIMEZONE']}，左闭右开）。\n"
-        body += "仅统计有效来源IPv4/IPv6；统计截至本次采集开始时刻已发布的日志，最近日志可能延迟到达。\n"
+        if reports[0].get("report_kind") == "since_yesterday":
+            body += "仅统计有效来源IPv4/IPv6；统计截至本次采集开始时刻已发布的日志，最近日志可能延迟到达。\n"
     body += "\n".join(f"{report['account_name']} ({report['account_id']})："
                       + ("采集步骤完整" if report["complete"] else "数据不完整，请核查缺段/日志/权限") for report in reports)
-    body += "\n\n附件按账号分别生成。SQL 语句次数与 AWS 管理 API 调用分开统计；不是影响行数或最终事务提交数。"
+    body += "\n\n附件按账号分别生成。SQL 语句次数与 AWS 管理 API 调用分开统计。"
     status = {"date": day.isoformat(), "label": label, "at": iso(now), "status": "sending", "complete": complete,
               "account_ids": sorted(report["account_id"] for report in reports), "fingerprint": fingerprint,
               "delivery_key": delivery_key,
