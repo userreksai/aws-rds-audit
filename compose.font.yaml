@@ -1,0 +1,9 @@
+services:
+  audit:
+    volumes:
+      - type: bind
+        source: ${AUDIT_FONT_SOURCE:?Set AUDIT_FONT_SOURCE to an existing font file}
+        target: ${AUDIT_CONTAINER_FONT_PATH:?Set AUDIT_CONTAINER_FONT_PATH from the configuration plan}
+        read_only: true
+        bind:
+          create_host_path: false

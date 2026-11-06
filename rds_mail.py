@@ -48,7 +48,7 @@ def _addresses(values, name, *, required=False):
 
 
 def send_reports(config: dict, attachments: list[Path], body: str,
-                 subject: str | None = None) -> dict:
+                 subject: str | None = None, *, html_body: str | None = None) -> dict:
     """Submit all account PDFs in one TLS-protected SMTP transaction.
 
     Failures expose only the operation stage and error class, never the provider's
@@ -76,6 +76,8 @@ def send_reports(config: dict, attachments: list[Path], body: str,
         raise ValueError("SMTP_SECURITY 仅支持 ssl 或 starttls")
     if not isinstance(body, str):
         raise ValueError("邮件正文必须为字符串")
+    if html_body is not None and not isinstance(html_body, str):
+        raise ValueError("HTML 邮件正文必须为字符串")
     if not attachments:
         raise ValueError("邮件至少需要一个 PDF 附件")
 
@@ -88,6 +90,8 @@ def send_reports(config: dict, attachments: list[Path], body: str,
     message["Date"] = formatdate(localtime=False, usegmt=True)
     message["Message-ID"] = make_msgid()
     message.set_content(body)
+    if html_body is not None:
+        message.add_alternative(html_body, subtype="html")
     names = set()
     for item in attachments:
         path = Path(item)

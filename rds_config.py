@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import re
+import unicodedata
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -21,6 +22,9 @@ DEFAULTS = {
     "RETENTION_DAYS": 7,
     "TIMEZONE": "Asia/Shanghai",
     "DAILY_MAIL_TIME": "08:10",
+    # Blank values preserve natural-day reports for existing private configs.
+    "REPORT_START_TIME": "",
+    "REPORT_END_TIME": "",
     "AUTO_MAIL_MAX_PER_DAY": 1,
     "MAIL_REPORT_MODE": "previous_day",
     "MAIL_SUBJECT": "AW-RDS审计报告",
@@ -47,6 +51,7 @@ DEFAULTS = {
     "LARK_NOTIFICATION_RETRY_MINUTES": 5,
 }
 ACCOUNT_DEFAULTS = {
+    "TAG": "",
     "AWS_ACCESS_KEY_ID": "",
     "AWS_SECRET_ACCESS_KEY": "",
     "AWS_SESSION_TOKEN": "",
@@ -269,8 +274,11 @@ def load_config(path, require_mail=False):
         raise ValueError("TIMEZONE 必须为有效 IANA 时区") from None
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", result["DAILY_MAIL_TIME"]):
         raise ValueError("DAILY_MAIL_TIME 必须为 HH:MM")
+    from rds_schedule import validate_report_schedule
+
+    validate_report_schedule(result)
     if result["MAIL_REPORT_MODE"] != "previous_day":
-        raise ValueError("MAIL_REPORT_MODE 目前仅支持 previous_day 自然日汇总")
+        raise ValueError("MAIL_REPORT_MODE 目前仅支持 previous_day 日报模式")
     _validate_lark_settings(result, require_complete=require_mail)
     result.update(validate_mail_config(result, require_complete=require_mail))
     accounts = result.get("ACCOUNTS")
@@ -282,8 +290,12 @@ def load_config(path, require_mail=False):
         if not isinstance(item, dict):
             raise ValueError(prefix + " 必须为对象")
         account = {**ACCOUNT_DEFAULTS, **item}
-        for key in ("NAME", "ACCOUNT_ID", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+        for key in ("NAME", "ACCOUNT_ID", "TAG", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
             account[key] = _text(account.get(key), prefix + "." + key, required=key in ("NAME", "ACCOUNT_ID"))
+        if (len(account["TAG"]) > 120
+                or any(unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+                       for char in item.get("TAG", ""))):
+            raise ValueError(prefix + ".TAG 必须为不超过 120 字符且无控制字符的字符串")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", account["NAME"]):
             raise ValueError(prefix + ".NAME 仅允许 1-80 位字母、数字、下划线和连字符")
         if not re.fullmatch(r"\d{12}", account["ACCOUNT_ID"]):

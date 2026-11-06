@@ -59,7 +59,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(account[key], "")
         for field in ("SMTP_HOST", "SMTP_USERNAME", "SMTP_AUTH_CODE"):
             self.assertEqual(result[field], "")
-        self.assertTrue(result["LARK_ALERTS_ENABLED"])
+        self.assertFalse(result["LARK_ALERTS_ENABLED"])
         self.assertEqual(result["LARK_WEBHOOK_URL"], "")
         self.assertEqual(result["LARK_SIGNING_SECRET"], "")
 
@@ -70,6 +70,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["ACCOUNTS"][0]["REGIONS"], "ap-east-1,us-east-1")
         self.assertEqual(result["ACCOUNTS"][1]["AWS_PROFILE"], "audit-staging")
         self.assertEqual(result["ACCOUNTS"][1]["REGIONS"], "all")
+
+    def test_chinese_account_tags_are_optional_trimmed_and_do_not_change_directory_names(self):
+        self.base["ACCOUNTS"][0]["TAG"] = "  测试账号  "
+        result = self.load()
+        self.assertEqual(result["ACCOUNTS"][0]["TAG"], "测试账号")
+        self.assertEqual(result["ACCOUNTS"][0]["NAME"], "production")
+        self.assertEqual(result["ACCOUNTS"][1]["TAG"], "")
+        self.base["ACCOUNTS"][0]["TAG"] = "中" * 120
+        self.assertEqual(self.load()["ACCOUNTS"][0]["TAG"], "中" * 120)
+
+    def test_invalid_tags_are_refused_without_echoing_values(self):
+        for value in (None, 42, ["private"], "PRIVATE" * 21, "PRIVATE\nTAG", "PRIVATE\x7f",
+                      "PRIVATE\u202eTAG", "PRIVATE\u2028TAG", "PRIVATE\u2029TAG", "PRIVATE\ud800TAG"):
+            with self.subTest(value=repr(value)):
+                self.base["ACCOUNTS"][0]["TAG"] = value
+                with self.assertRaisesRegex(ValueError, "TAG") as raised:
+                    self.load()
+                self.assertNotIn("PRIVATE", str(raised.exception))
 
     def test_account_validation_does_not_echo_secrets(self):
         cases = [

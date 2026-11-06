@@ -1,0 +1,26 @@
+# Deny all files unless explicitly needed by the production image.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!rds_audit.py
+!rds_cache.py
+!rds_change_filter.py
+!rds_config.py
+!rds_daily_mail.py
+!rds_failure_alerts.py
+!rds_mail.py
+!rds_multi.py
+!rds_pdf.py
+!rds_retention.py
+!rds_summary.py
+!rds_report.py
+!rds_window.py
+!rds_mail_summary.py
+!rds_schedule.py
+!lark_notify.py
+!rds-audit-config.example.json
+!deploy/
+deploy/**
+!deploy/docker_runtime.py
+!deploy/docker_config.py

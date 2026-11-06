@@ -1,0 +1,38 @@
+services:
+  audit:
+    image: ${AUDIT_IMAGE:-aws-rds-audit:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    user: "${AUDIT_UID:-0}:${AUDIT_GID:-0}"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ${AUDIT_CONFIG_PATH:-/usr/local/aws-rds-shenji/rds-audit-config.json}
+        target: /usr/local/aws-rds-shenji/rds-audit-config.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AUDIT_OUTPUT_DIR:-/usr/local/aws-rds-shenji/output}
+        target: ${AUDIT_CONTAINER_OUTPUT_DIR:-/usr/local/aws-rds-shenji/output}
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

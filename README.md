@@ -1,10 +1,10 @@
 # AWS RDS 多账号来源 IP 审计邮件
 
-在一个带中文注释的私有 JSON 配置中管理多个 AWS 账号，分段读取 RDS MySQL / Aurora MySQL 的 CloudWatch audit 日志，以**发起操作的来源 IP**汇总新增、删除、修改及失败次数。每个账号生成一份中文 PDF，所有启用账号的 PDF 作为附件放在同一封邮件中，支持收件人与抄送。
+在一个带中文注释的私有 JSON 配置中管理多个 AWS 账号，分段读取 RDS MySQL / Aurora MySQL 的 CloudWatch audit 日志，以**发起操作的来源 IP**汇总新增、删除、修改及失败次数。邮件正文包含问候、实际查询范围、账号总数、账号标签和来源 IP 汇总表；每个账号生成一份中文 PDF，所有启用账号的 PDF 作为附件放在同一封邮件中，支持收件人与抄送。正文同时提供纯文本与 HTML，排版与 AWS 用户审计邮件相近。
 
-默认同时采集 7 个账号，每账号每 30 分钟形成一个数据分段，也可配置为 60 分钟；每天北京时间 08:10 发送**昨日 00:00 至今日 00:00**的自然日汇总。不是旧版前日 07:00 至今日 08:00 的 25 小时窗口。并发数、时区、发信时间、采集间隔和本地保留天数都在配置中调整。
+新配置模板默认每天北京时间 **10:10** 发送**昨日 10:00 至今日 10:00（结束时刻不含）**的汇总。每账号每 30 分钟形成一个数据分段，也可配置为 60 分钟；默认最多并发采集 7 个账号。时区、发信时间、查询起止时刻、采集间隔和本地保留天数都在配置中调整。已有配置缺少 `REPORT_START_TIME` / `REPORT_END_TIME` 时保留原来的自然日窗口，升级不会覆盖私有配置。
 
-自动日报邮件标题使用配置时区的**发送当天日期**，正文注明实际统计时间段。例如北京时间 11 月 4 日发送的标题为 `AW-RDS审计报告 2026-11-04`，统计窗口为 11 月 3 日 00:00 至 11 月 4 日 00:00；PDF 与本地目录仍按真实统计日期 11 月 3 日命名。手动指定日期的邮件使用指定统计日期，昨日到当前的邮件保留区间标题。
+自动日报邮件标题使用配置时区的**发送当天日期**，正文注明实际统计时间段。例如北京时间 11 月 6 日发送的标题为 `AW-RDS审计报告 2026-11-06`，新模板统计窗口为 11 月 5 日 10:00 至 11 月 6 日 10:00。手动指定日期的邮件使用指定报告日期，昨日到当前的邮件保留区间标题。
 
 **自动邮件默认每天最多 1 封，所有账号合并发送。** 补采、数据变化、完整度变化、修改收件人或升级采集口径都不触发当天第二封自动邮件，也不自动发送修订版；只更新本地 PDF。手动执行带 `--send-mail` 的命令属于额外明确发送，不受自动邮件限额影响。
 
@@ -32,7 +32,9 @@ chmod 600 rds-audit-config.json
   "ACCOUNT_CONCURRENCY": 7,
   "RETENTION_DAYS": 7,
   "TIMEZONE": "Asia/Shanghai",
-  "DAILY_MAIL_TIME": "08:10",
+  "DAILY_MAIL_TIME": "10:10",
+  "REPORT_START_TIME": "10:00",
+  "REPORT_END_TIME": "10:00",
   "AUTO_MAIL_MAX_PER_DAY": 1,
   "MAIL_REPORT_MODE": "previous_day",
   "SMTP_HOST": "",
@@ -45,7 +47,7 @@ chmod 600 rds-audit-config.json
   "MAIL_CC": [],
   "MAIL_SUBJECT": "AW-RDS审计报告",
   "MAIL_SENDER_NAME": "",
-  "LARK_ALERTS_ENABLED": true,
+  "LARK_ALERTS_ENABLED": false,
   "LARK_WEBHOOK_URL": "",
   "LARK_SIGNING_SECRET": "",
   "LARK_ALERT_AFTER_FAILURES": 2,
@@ -54,6 +56,7 @@ chmod 600 rds-audit-config.json
   "ACCOUNTS": [
     {
       "NAME": "production",
+      "TAG": "生产账号",
       "ACCOUNT_ID": "000000000001",
       "AWS_ACCESS_KEY_ID": "",
       "AWS_SECRET_ACCESS_KEY": "",
@@ -64,6 +67,7 @@ chmod 600 rds-audit-config.json
     },
     {
       "NAME": "staging",
+      "TAG": "测试账号",
       "ACCOUNT_ID": "000000000002",
       "AWS_ACCESS_KEY_ID": "",
       "AWS_SECRET_ACCESS_KEY": "",
@@ -77,18 +81,36 @@ chmod 600 rds-audit-config.json
 ```
 
 - `MAIL_RECIPIENTS` / `MAIL_CC` 使用邮箱数组，例如 `["audit@example.com", "ops@example.com"]`；CC 可为空。`SMTP_USERNAME` 同时作为发件邮箱。465 默认 SSL；需要 587 STARTTLS 时相应修改端口和 `SMTP_SECURITY`。
+- 邮件字段与 AWS 用户审计一致：`SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURITY`、`SMTP_TIMEOUT`、`SMTP_USERNAME`、`SMTP_AUTH_CODE`、`MAIL_RECIPIENTS`、`MAIL_CC`、`MAIL_SUBJECT`、`MAIL_SENDER_NAME`。在同一个私有 JSON 中填写账号与通知配置，无需另建邮件配置文件。
 - `NAME` 是目录标签，只支持字母、数字、下划线和连字符；`NAME` 与 `ACCOUNT_ID` 各自不得重复。真正采集前使用 STS 核验 Key 对应的账号，账号不匹配不会采集。
+- `TAG` 是可选的账号显示标签，支持中文、最多 120 字符，例如 `测试账号`；邮件账号信息显示为 `测试账号-796973492024`。未填写时使用原 `NAME`，不改变账号目录。
+- `REPORT_START_TIME` / `REPORT_END_TIME` 成对配置，表示从前一天的开始时刻到报告结束日的结束时刻，结束时刻不含。边界必须对齐 `COLLECTION_INTERVAL_MINUTES`：30 分钟分段可设整点或半点，60 分钟分段只能设整点。新模板均为 `10:00`，`DAILY_MAIL_TIME` 为 `10:10`；采集预留的日志延迟由 `LOG_DELAY_MINUTES` 控制。旧配置不含这两个字段或两者均为空时继续生成自然日报告。
 - `ACCOUNT_CONCURRENCY` 是同时采集账号数，默认 7、范围 1-32；实际并发取该值与启用账号数的较小值。账号总数不受并发数限制，超出的账号自动排队；设为 1 即顺序采集。每个工作线程独立创建 boto3 Session、分页读取、分段和补采状态，不跨账号共享凭据或缓存。
 - `AUTO_MAIL_MAX_PER_DAY` 仅支持 `1`（每天最多一封自动邮件）或 `0`（关闭自动邮件，仅更新本地 PDF）；旧配置没有该字段也默认 `1`。自然日按 `TIMEZONE` 计算。关闭自动邮件时可不填写 SMTP；手动明确发送时仍需完整 SMTP 配置。
 - 每账号支持成对的 Access Key / Secret Key、临时凭据 Token，或 `AWS_PROFILE`；Key 与 profile 不可同时配置。均为空时使用该服务用户的标准 AWS 凭据链。`ENABLED: false` 暂停该账号采集和报告。
 - `OUTPUT_DIRECTORY` 相对**配置文件所在目录**解析，所以默认输出为 `/usr/local/aws-rds-shenji/output/`；也可填写绝对路径。不要指向网页公开目录。
 - 完整示例还包括 `MAX_BUCKETS_PER_ACCOUNT_PER_RUN`（默认 6）、`LOG_DELAY_MINUTES`（默认 5）、`REFRESH_DELAY_MINUTES`（默认 60）和 `PDF_FONT_PATH`（可选中文 TTF 字体）。
 - 私有配置与 `output/` 已加入 Git 忽略规则。不要提交真实 Key 或 SMTP 授权码；源码更新不会替换私有配置。
-- 新模板默认开启 Lark 异常告警，安装前填写 `LARK_WEBHOOK_URL`；支持 Lark 与飞书群机器人，启用签名校验时填 `LARK_SIGNING_SECRET`。没有这些字段的旧配置默认关闭，合并新配置时需显式添加并开启。
+- 新模板默认关闭 Lark 异常告警，与 AWS 用户审计配置一致。需要异常通知时填写 `LARK_WEBHOOK_URL` 并设置 `LARK_ALERTS_ENABLED: true`；支持 Lark 与飞书群机器人，启用签名校验时填 `LARK_SIGNING_SECRET`。没有这些字段的旧配置默认关闭。
 
 每个账号使用 [iam-policy-rds-audit.json](iam-policy-rds-audit.json) 的读取权限。新模式主要使用 CloudTrail `LookupEvents`、CloudWatch `DescribeLogGroups` / `FilterLogEvents`；`REGIONS: "all"` 还需要 EC2 `DescribeRegions`。程序不修改数据库、审计设置、IAM 或 Nginx。数据库当时必须已经启用相应审计并导出到 CloudWatch；详细说明见 [RDS_AUDIT.md](RDS_AUDIT.md)。
 
+## 邮件正文示例
+
+```text
+各位领导和同事好：
+RDS 来源 IP 审计汇总
+查询范围（北京时间，结束时刻不含）：
+2026-11-05 10:00:00 至 2026-11-06 10:00:00
+账号总数：1
+账号信息：测试账号-796973492024
+```
+
+其后按账号展示采集完整度和来源 IP 表，数据库内部 SQL 与 RDS 管理 API 分开列出新增、删除、修改、失败次数。HTML 邮件使用表格，纯文本邮件保留同样的信息；完整 PDF 作为附件。零操作、不完整采集和不可用统计分别说明，不会把查询失败展示成完整的零操作。
+
 ## 安装与更新
+
+支持 systemd 与 Docker 两种部署方式。Docker 使用同一份私有 JSON 和相同的邮件、采集及每日限额逻辑，步骤见 [Docker 部署](DOCKER.md)。已有 systemd 部署可继续使用以下方式。
 
 Linux + systemd、Python 3.10+。配置填写完毕后：
 
@@ -117,6 +139,8 @@ sudo bash install.sh --config ./rds-audit-config.json --user root --no-enable
 
 两个定时器均每 5 分钟唤醒一次：采集任务仅处理配置的 30/60 分钟已结束分段及重试，不会每 5 分钟重拉整日；邮件任务读取配置中的时区和发送时间。修改 JSON 中的间隔、保留天数和发信时间后下一轮生效，无需重建定时器。改变区域、时区或分段长度会隔离为新缓存范围，并重新回填昨日与今日，不会混入旧口径。
 
+新模板让 10:00 结束的末段在 5 分钟日志缓冲后，于 10:05 进入采集，再从 10:10 开始发信，给末段一次采集机会。大量积压、慢查询或错误仍可能导致首封报告不完整；邮件会明确标记，后续补采只更新本地 PDF，当天不会自动再发第二封。旧私有配置中的发信时间保持原值，需要采用新时间时显式修改 `DAILY_MAIL_TIME`。
+
 首次部署从昨日零点开始逐段回填，每账号每轮最多处理 6 段；补齐昨日和今日可能需要多轮。采集预留 5 分钟日志发布缓冲；成功分段在结束 60 分钟后再采一次，使用新快照**替换**旧快照，不累加重复计数。失败分段以 5 分钟至 1 小时退避重试，在保留窗口内继续补采。更迟到达或已被源端删除的日志仍可能缺失。
 
 账号失败不会阻止其它账号继续采集。同类采集任务和同类邮件任务各自加锁，避免重叠运行；采集与邮件可同时进行，邮件读取已经原子提交的本地快照，长时间采集不会一直阻塞日报。进行中的分段标记为不完整；清理只在采集和邮件都空闲时执行，忙时延到下一轮。邮件正文列出每个账号的覆盖状态；没有数据、缺段和解析失败不会伪装成完整的零操作。
@@ -144,6 +168,8 @@ sudo bash install.sh --config ./rds-audit-config.json --user root --no-enable
       combined-mail.json       # 合并投递凭据保存在最小账号ID对应目录
 ```
 
+上例是旧自然日模式的归档。配置每日查询时刻后，报告日期使用**结束日**，例如 `2026-11-06` 代表 11 月 5 日 10:00 至 11 月 6 日 10:00；报告、PDF 与投递回执写入该日期的 `manual/window-1000-1000/`。不同查询窗口与旧自然日文件隔离，仍共用同一个每日自动邮件额度，不会因切换窗口而自动多发一封。
+
 `RETENTION_DAYS: 7` 表示按配置时区保留**含当天在内的 7 个自然日**；改为 `3` 就保留当天和前两天。每轮采集/邮件任务清理过期日期目录，其中的分段、PDF、状态一并清理。最低 2 天，确保昨日数据能留到次日邮件发送。该设置仅控制本机文件，不修改 AWS CloudWatch 保留期。
 
 只清理本程序带标记的账号/日期目录，不跟随符号链接或 junction；已有无标记目录拒绝收编。已移除或停用账号的旧标记目录也按同一保留天数过期。旧版 `cache/`、`reports/`、旧网页、未知文件和含链接的目录不会自动删除，避免误删；如有旧数据占用，请单独确认其保留策略。
@@ -157,11 +183,13 @@ sudo bash install.sh --config ./rds-audit-config.json --user root --no-enable
 .venv/bin/python rds_multi.py --config rds-audit-config.json --verify-accounts
 # 采集本轮到期分段
 .venv/bin/python rds_multi.py --config rds-audit-config.json --collect
-# 从本地分段生成昨日各账号 PDF，不连接 AWS、不发邮件
+# 从本地分段生成最近已结束窗口的各账号 PDF，不连接 AWS、不发邮件
 .venv/bin/python rds_multi.py --config rds-audit-config.json --report
-# 指定日期生成 PDF，并将所有账号附件合并发送
-.venv/bin/python rds_multi.py --config rds-audit-config.json --report --date 2026-11-03 --send-mail
+# 新模板：统计 11月5日10点至11月6日10点，并将所有账号附件合并发送
+.venv/bin/python rds_multi.py --config rds-audit-config.json --report --date 2026-11-06 --send-mail
 ```
+
+配置 `REPORT_START_TIME` / `REPORT_END_TIME` 时，`--date` 指定窗口的结束日；无这两个字段的旧配置仍将 `--date` 作为所选自然日。仅生成报告时读取本地已采集分段；发现缺段会如实标记不完整，不会自动把缺段当成零操作。
 
 需要立即查询**昨日 00:00 到本次采集开始时刻**并发送一次邮件时，使用跨日命令：
 
@@ -172,9 +200,9 @@ cd /usr/local/aws-rds-shenji
 
 该命令按配置时区确定昨日零点，所有账号使用同一个毫秒截止时间，直接分页查询整个跨日窗口，不受后台每轮 6 段上限限制，也不以已有零散缓存冒充完整窗口。按 `ACCOUNT_CONCURRENCY` 并发采集；若后台采集正在运行，最多等待 10 分钟后获取采集锁。每账号一份 PDF，所有启用账号作为同一封邮件的附件。去掉 `--send-mail` 仅生成 PDF。
 
-跨日 PDF 明确显示“昨日到当前”和实际起止时间；最新日志可能延迟发布，结果仅代表截止本次开始时刻已能查询到的记录。`--date` 仍仅用于单自然日报告，不能与 `--since-yesterday` 混用。跨日文件、JSON 和投递状态写入截止日的 `manual/since-yesterday-<UTC截止时间>/`，不覆盖每日 PDF 或日报投递凭据，并随该日期目录一起过期。
+跨日 PDF 明确显示“昨日到当前”和实际起止时间；最新日志可能延迟发布，结果仅代表截止本次开始时刻已能查询到的记录。该命令保留昨日零点到当前的独立含义，不使用 `REPORT_START_TIME` / `REPORT_END_TIME`，不能与 `--date` 混用。跨日文件、JSON 和投递状态写入截止日的 `manual/since-yesterday-<UTC截止时间>/`，不覆盖每日 PDF 或日报投递凭据，并随该日期目录一起过期。
 
-指定今日时，仅统计到经过日志缓冲的最近完整分段；报告窗口在 PDF 中明确显示，不冒充完整全天。指定日期必须仍在保留范围内。定时邮件只发送最近一个昨日，不自动逐日补发停机期间的历史邮件。
+报告窗口在 PDF 和正文中明确显示；未完成采集的部分会标记不完整。指定日期必须仍在保留范围内。定时邮件只处理最近一个到期的报告窗口，不自动逐日补发停机期间的历史邮件。
 
 SMTP 使用验证证书的 SSL / STARTTLS，To 与 CC 去重，所有账号 PDF 一次提交。自动邮件在发送前先持久预占当日额度，服务器接受后锁定额度。即使首封数据不完整，后续补采恢复、迟到数据、账号或收件人变化也只更新本地 PDF，不自动再次发送。`.daily-mail-budget.json` 保存按发送自然日计算的限额，按本地保留天数剪枝；升级首次识别已有日报成功回执，将当天视为已发，避免升级后再发一封“修订”。状态损坏不会自动重置额度。
 

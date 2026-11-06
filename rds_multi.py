@@ -25,6 +25,7 @@ from rds_cache import _exclusive
 from rds_config import load_config
 from rds_retention import DAY_MARKER, _is_link, prune_account_days
 from rds_summary import merge_summaries, validate_summary
+from rds_schedule import configured_window, latest_report_day, report_segments, report_window, window_tag
 
 UTC = timezone.utc
 PROJECT = Path(__file__).resolve().parent
@@ -384,11 +385,16 @@ def collect_accounts(config, now, **kwargs):
 
 def build_report(config, account, day, now):
     zone = ZoneInfo(config["TIMEZONE"])
+    custom = configured_window(config)
     start, day_end = day_window(day, zone)
+    if custom:
+        start, day_end = report_window(config, day)
+        if day_end + timedelta(minutes=config["LOG_DELAY_MINUTES"]) > now:
+            raise ValueError("配置的报告窗口尚未结束或仍处于日志缓冲期")
     if day > now.astimezone(zone).date():
         raise ValueError("不能生成未来日期的报告")
     end = day_end
-    if day == now.astimezone(zone).date():
+    if not custom and day == now.astimezone(zone).date():
         elapsed = max(0, (now - start).total_seconds() - config["LOG_DELAY_MINUTES"] * 60)
         completed = int(elapsed // (config["COLLECTION_INTERVAL_MINUTES"] * 60))
         end = min(day_end, start + timedelta(minutes=completed * config["COLLECTION_INTERVAL_MINUTES"]))
@@ -396,7 +402,7 @@ def build_report(config, account, day, now):
             raise ValueError("今日尚无已结束且经过日志缓冲的采集分段")
     summaries, errors = [], []
     expected = present = 0
-    for left, right in windows(day, zone, config["COLLECTION_INTERVAL_MINUTES"]):
+    for left, right in report_segments(config, start, end):
         if right > end:
             break
         expected += 1
@@ -413,7 +419,8 @@ def build_report(config, account, day, now):
         except (OSError, ValueError, KeyError, TypeError):
             errors.append({"scope": iso(left), "error_type": "MissingOrInvalidBucket"})
     merged = merge_summaries(summaries, start, end, dimension="ip")
-    return {**merged, "account_id": account["ACCOUNT_ID"], "account_name": account["NAME"],
+    return {**merged, **({"artifact_tag": window_tag(config), "report_kind": "configured_window"} if custom else {}),
+            "account_id": account["ACCOUNT_ID"], "account_name": account["NAME"],
             "date": day.isoformat(), "timezone": config["TIMEZONE"], "generated_at": iso(now),
             "complete": bool(merged["complete"] and not errors), "errors": errors + merged["errors"],
             "segments": {"expected": expected, "present": present},
@@ -456,11 +463,14 @@ def _delivery_path(config, day):
     # A single combined-mail receipt belongs to one enabled account/day, so it
     # expires with that day's PDFs rather than growing a global delivery ledger.
     account = min((account for account in config["ACCOUNTS"] if account["ENABLED"]), key=lambda item: item["ACCOUNT_ID"])
+    if configured_window(config):
+        return manual_directory(config, account, day, window_tag(config)) / "combined-mail.json"
     return day_directory(config, account, day) / "combined-mail.json"
 
 
 def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt_path=None, label=None, automatic=False):
     from rds_mail import MailDeliveryError, send_reports
+    from rds_mail_summary import message_body, message_body_html
 
     receipt_path = Path(receipt_path) if receipt_path is not None else _delivery_path(config, day)
     # Automatic subjects name the sending day; report paths and receipts retain
@@ -481,6 +491,13 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
                                   for report in reports), key=lambda item: item["account_id"]),
                "mail": {key: config[key] for key in ("MAIL_SUBJECT", "SMTP_HOST", "SMTP_USERNAME", "MAIL_SENDER_NAME")},
                "to": sorted(config["MAIL_RECIPIENTS"]), "cc": sorted(config["MAIL_CC"])}
+    # Display tags are public metadata, never credentials. Preserve old receipt
+    # fingerprints when no tag was configured, so upgrading the body alone does
+    # not create another manual delivery of an otherwise identical report.
+    tags = {account["ACCOUNT_ID"]: account["TAG"] for account in config["ACCOUNTS"]
+            if account.get("TAG") and account["ACCOUNT_ID"] in {report["account_id"] for report in reports}}
+    if tags:
+        content["account_tags"] = tags
     fingerprint = hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     context = {"scopes": sorted((report["scope"] for report in reports), key=lambda item: item["account_id"]),
                "mail": content["mail"], "to": content["to"], "cc": content["cc"]}
@@ -496,18 +513,8 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
             atomic_json(receipt_path, previous)
         return previous
     attachments = _render_reports(config, reports)
-    body = f"{label} RDS 来源 IP 审计汇总，共 {len(reports)} 个账号。\n"
-    if reports:
-        window = reports[0]["window"]
-        zone = ZoneInfo(config["TIMEZONE"])
-        local_start = datetime.fromisoformat(window["start_inclusive"].replace("Z", "+00:00")).astimezone(zone)
-        local_end = datetime.fromisoformat(window["end_exclusive"].replace("Z", "+00:00")).astimezone(zone)
-        body += f"窗口：{local_start:%Y-%m-%d %H:%M:%S} 至 {local_end:%Y-%m-%d %H:%M:%S}（{config['TIMEZONE']}，左闭右开）。\n"
-        if reports[0].get("report_kind") == "since_yesterday":
-            body += "仅统计有效来源IPv4/IPv6；统计截至本次采集开始时刻已发布的日志，最近日志可能延迟到达。\n"
-    body += "\n".join(f"{report['account_name']} ({report['account_id']})："
-                      + ("采集步骤完整" if report["complete"] else "数据不完整，请核查缺段/日志/权限") for report in reports)
-    body += "\n\n附件按账号分别生成。SQL 语句次数与 AWS 管理 API 调用分开统计。"
+    body = message_body(config, reports)
+    html_body = message_body_html(config, reports)
     status = {"date": day.isoformat(), "label": label, "at": iso(now), "status": "sending", "complete": complete,
               "account_ids": sorted(report["account_id"] for report in reports), "fingerprint": fingerprint,
               "delivery_key": delivery_key,
@@ -517,7 +524,7 @@ def deliver(config, day, now, *, force=False, sender=None, reports=None, receipt
         result = (sender or send_reports)(config, attachments, body,
                                          subject=config["MAIL_SUBJECT"] + " " + label
                                          + (" [修订]" if previous.get("status") == "accepted" and not automatic else "")
-                                         + ("" if complete else " [数据不完整]"))
+                                         + ("" if complete else " [数据不完整]"), html_body=html_body)
         status.update(status="accepted", smtp_accepted=True, message_id=result.get("message_id"))
     except MailDeliveryError as exc:
         status.update(status="uncertain" if exc.delivery_uncertain else "failed",
@@ -542,17 +549,29 @@ def daily_receipts(config, day):
         owner = read_json(marker)
         if not isinstance(owner, dict) or directory.name != str(owner.get("account_name", "")) + "-" + str(owner.get("account_id", "")):
             continue
-        day_path = directory / day.isoformat()
-        if not day_path.is_dir() or _is_link(day_path):
-            continue
-        path = day_path / "combined-mail.json"
-        if path.exists():
-            if _is_link(path):
-                raise ValueError("日报投递状态不可为链接")
-            value = read_json(path)
-            if not isinstance(value, dict):
-                raise ValueError("日报投递状态格式异常")
-            receipts.append(value)
+        # Recognise legacy evidence across the change from data-day dates to
+        # cutoff end dates, without including yesterday-to-now manual reports.
+        days = (day, day - timedelta(days=1)) if configured_window(config) else (day, day + timedelta(days=1))
+        for candidate in days:
+            day_path = directory / candidate.isoformat()
+            if not day_path.is_dir() or _is_link(day_path):
+                continue
+            paths = [day_path / "combined-mail.json"] if candidate == day or configured_window(config) else []
+            manual = day_path / "manual"
+            if manual.is_dir() and not _is_link(manual):
+                for window in manual.glob("window-*"):
+                    if _is_link(window):
+                        raise ValueError("日报投递目录不可为链接")
+                    if window.is_dir():
+                        paths.append(window / "combined-mail.json")
+            for path in paths:
+                if path.exists():
+                    if _is_link(path):
+                        raise ValueError("日报投递状态不可为链接")
+                    value = read_json(path)
+                    if not isinstance(value, dict):
+                        raise ValueError("日报投递状态格式异常")
+                    receipts.append(value)
     return receipts
 
 
@@ -601,6 +620,9 @@ def scheduled_day(config, now):
     hour, minute = map(int, config["DAILY_MAIL_TIME"].split(":"))
     if (local.hour, local.minute) < (hour, minute):
         return None
+    if configured_window(config):
+        day = latest_report_day(config, now)
+        return day if day == local.date() else None
     return local.date() - timedelta(days=1)
 
 
@@ -642,7 +664,7 @@ def main(argv=None):
     mode.add_argument("--scheduled", action="store_true")
     mode.add_argument("--report", action="store_true")
     mode.add_argument("--since-yesterday", action="store_true", help="直接采集昨日00:00到本次开始时刻，生成跨日PDF")
-    parser.add_argument("--date", type=date.fromisoformat)
+    parser.add_argument("--date", type=date.fromisoformat, help="报告日期；配置 REPORT_START/END_TIME 时为窗口结束日")
     parser.add_argument("--send-mail", action="store_true")
     parser.add_argument("--force-resend", action="store_true", help="仅人工核实投递后显式重发")
     args = parser.parse_args(argv)
@@ -747,7 +769,7 @@ def main(argv=None):
                     else:
                         result = (0 if status["complete"] else 2) if status["status"] == "accepted" else 3
             else:
-                day = args.date or today - timedelta(days=1)
+                day = args.date or latest_report_day(config, now)
                 if day < today - timedelta(days=config["RETENTION_DAYS"] - 1):
                     raise ValueError("报告日期已超出本地保留窗口，请先调整配置并另行补采")
                 if args.send_mail:
