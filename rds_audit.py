@@ -140,6 +140,10 @@ def iter_items(client, operation, result_key, *, request_token="Marker", respons
     tokens = None
     try:
         while True:
+            # Delay every request, including the first page of a new segment.
+            # CloudTrail's per-account/Region quota also spans segment queries.
+            if delay:
+                time.sleep(delay)
             response = getattr(client, operation)(**kwargs)
             yield from response.get(result_key, [])
             token = response.get(response_token)
@@ -156,8 +160,6 @@ def iter_items(client, operation, result_key, *, request_token="Marker", respons
             if not tokens.execute("INSERT OR IGNORE INTO cursors VALUES(?)", (digest,)).rowcount:
                 raise RuntimeError(f"{operation}: repeated pagination token; results are incomplete")
             kwargs[request_token] = token
-            if delay:
-                time.sleep(delay)
     finally:
         if tokens is not None:
             tokens.close()

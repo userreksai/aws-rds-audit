@@ -19,6 +19,12 @@ jobs:
       - run: python -m unittest discover -v
         env:
           AWS_EC2_METADATA_DISABLED: 'true'
+      - name: Verify streaming across 100000 SQL events offline
+        if: matrix.python-version == '3.12'
+        run: python -m unittest test_rds_pagination_review.PaginationReviewTests.test_streams_100000_unique_events_with_empty_pages_and_duplicates -v
+        env:
+          AWS_EC2_METADATA_DISABLED: 'true'
+          RDS_REVIEW_STRESS: '1'
       - run: bash -n install.sh
       - run: bash -n install-mail.sh
       - run: bash -n install-docker.sh

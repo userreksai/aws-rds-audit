@@ -234,7 +234,15 @@ def bucket_observation(config, account, state, start, end):
                             if isinstance(error, dict)]}
 
 
-def collect_account(config, account, now, *, session_factory=create_session, collector=collect_bucket):
+def collect_account(config, account, now, *, session_factory=create_session, collector=collect_bucket, monotonic=None):
+    clock = monotonic or process_time.monotonic
+    run_started = clock()
+
+    def effective_now():
+        # Anchor persisted wall-clock timestamps to the caller's run time while
+        # accounting for slow requests without depending on wall-clock jumps.
+        return now + timedelta(seconds=max(0, clock() - run_started))
+
     session = session_factory(account)
     identity = check_identity(session, account)
     zone = ZoneInfo(config["TIMEZONE"])
@@ -276,50 +284,61 @@ def collect_account(config, account, now, *, session_factory=create_session, col
                 interrupted = True
             if state:
                 observations[iso(start)] = bucket_observation(config, account, state, start, end)
-            if state.get("next_retry", 0) > now.timestamp():
+            if state.get("next_retry", 0) > effective_now().timestamp():
                 continue
             active = state.get("active")
             if not active or not active.get("complete"):
-                pending.append((start, end, path, state))
+                pending.append((start, end, path))
             elif (not state.get("refresh_done") and
-                  now >= end + timedelta(minutes=config["REFRESH_DELAY_MINUTES"])):
-                refresh.append((start, end, path, state))
+                  effective_now() >= end + timedelta(minutes=config["REFRESH_DELAY_MINUTES"])):
+                refresh.append((start, end, path))
         day += timedelta(days=1)
     # Prioritise fresh/missing data over the single delayed refresh of complete buckets.
+    # Planning retains only bucket paths and small alert metadata. Incomplete
+    # snapshots can contain many IP counters; do not queue their full payloads.
+    state = active = None
     done, failed = 0, 0
     if interrupted:
-        dispatch_collection_alerts(config, account, root, list(observations.values()), now)
-    for start, end, path, state in (pending + refresh)[:config["MAX_BUCKETS_PER_ACCOUNT_PER_RUN"]]:
+        dispatch_collection_alerts(config, account, root, list(observations.values()), effective_now())
+    for start, end, path in (pending + refresh)[:config["MAX_BUCKETS_PER_ACCOUNT_PER_RUN"]]:
+        state = previous = snapshot = None
+        try:
+            state = load_bucket(path, config, account, start, end) if path.exists() else {}
+        except (ValueError, KeyError, TypeError):
+            state = {}
+        attempt_started = effective_now()
         attempt = int(state.get("attempts", 0)) + 1
         previous_failures = state.get("consecutive_failures", 0)
         previous = state.get("active")
         state.update(schema_version=1, scope=scope_for(config, account),
                      window={"start_inclusive": iso(start), "end_exclusive": iso(end)},
-                     attempts=attempt, in_progress=True, last_attempt_at=iso(now))
+                     attempts=attempt, in_progress=True, last_attempt_at=iso(attempt_started))
         atomic_json(path, state)
         errors = []
         try:
             with tempfile.TemporaryDirectory(prefix=".attempt-", dir=path.parent) as temporary:
                 snapshot = collector(config, account, session, identity, start, end, Path(temporary))
             validate_summary(snapshot["summary"], start, end, dimension="ip")
-            snapshot["collected_at"] = iso(now)
+            finished = effective_now()
+            snapshot["collected_at"] = iso(finished)
             if snapshot["complete"] or not previous or not previous.get("complete"):
                 state["active"] = snapshot
             errors = snapshot.get("errors", [])
             succeeded = bool(snapshot["complete"])
         except Exception as exc:
+            finished = effective_now()
             errors = [{"scope": "collect", "error_type": type(exc).__name__}]
             succeeded = False
         if not succeeded and not errors:
             errors = [{"scope": "collect", "error_type": "IncompleteCollection"}]
-        refreshed = bool(state.get("refresh_done")) or (succeeded and now >= end + timedelta(minutes=config["REFRESH_DELAY_MINUTES"]))
+        refreshed = bool(state.get("refresh_done")) or (succeeded and attempt_started >= end + timedelta(minutes=config["REFRESH_DELAY_MINUTES"]))
         consecutive = 0 if succeeded else previous_failures + 1
         state.update(schema_version=1, scope=scope_for(config, account),
                      window={"start_inclusive": iso(start), "end_exclusive": iso(end)},
-                     attempts=attempt, last_attempt_at=iso(now), last_errors=errors, in_progress=False,
+                     attempts=attempt, last_attempt_at=iso(attempt_started), last_errors=errors, in_progress=False,
                      consecutive_failures=consecutive,
                      refresh_done=refreshed,
-                     next_retry=0 if succeeded else int(now.timestamp()) + min(3600, 300 * 2 ** min(consecutive - 1, 4)))
+                     next_retry=0 if succeeded else int(finished.timestamp()) + min(3600, 300 * 2 ** min(consecutive - 1, 4)))
         atomic_json(path, state)
         observations[iso(start)] = bucket_observation(config, account, state, start, end)
         if not succeeded:
@@ -331,13 +350,19 @@ def collect_account(config, account, now, *, session_factory=create_session, col
         done += 1
         failed += not succeeded
     result = {"processed": done, "failed": failed, "remaining": max(0, len(pending + refresh) - done)}
-    notification = dispatch_collection_alerts(config, account, root, list(observations.values()), now)
+    notification = dispatch_collection_alerts(config, account, root, list(observations.values()), effective_now())
     if config.get("LARK_ALERTS_ENABLED", False):
         result.update(alert_failed=notification["failed"], alert_pending=notification["pending"])
     return result
 
 
 def _collect_one_account(config, account, now, kwargs):
+    clock = kwargs.get("monotonic") or process_time.monotonic
+    run_started = clock()
+
+    def effective_now():
+        return now + timedelta(seconds=max(0, clock() - run_started))
+
     try:
         result = collect_account(config, account, now, **kwargs)
     except Exception as exc:
@@ -356,13 +381,14 @@ def _collect_one_account(config, account, now, kwargs):
                 count = 0
             unhealthy = bool(result.get("error_type"))
             count = count + 1 if unhealthy else 0
-            atomic_json(health_path, {"consecutive_failures": count, "at": iso(now)})
+            finished = effective_now()
+            atomic_json(health_path, {"consecutive_failures": count, "at": iso(finished)})
             notification = dispatch_collection_alerts(config, account, directory.parent,
                 [{"key": "account-health", "failed": unhealthy, "consecutive_failures": count,
-                  "attempts": count, "error_types": [result["error_type"]] if unhealthy else []}], now)
+                  "attempts": count, "error_types": [result["error_type"]] if unhealthy else []}], finished)
             result.update(alert_failed=result.get("alert_failed", 0) + notification["failed"],
                           alert_pending=notification["pending"])
-        atomic_json(directory / "collection-status.json", {"at": iso(now), **result})
+        atomic_json(directory / "collection-status.json", {"at": iso(effective_now()), **result})
     except Exception as exc:
         result.update(failed=max(1, result["failed"]), storage_error_type=type(exc).__name__)
     print(f"账号 {account['NAME']} ({account['ACCOUNT_ID']})：采集 {result['processed']} 段，失败 {result['failed']}。")
@@ -400,25 +426,29 @@ def build_report(config, account, day, now):
         end = min(day_end, start + timedelta(minutes=completed * config["COLLECTION_INTERVAL_MINUTES"]))
         if end <= start:
             raise ValueError("今日尚无已结束且经过日志缓冲的采集分段")
-    summaries, errors = [], []
+    errors = []
     expected = present = 0
-    for left, right in report_segments(config, start, end):
-        if right > end:
-            break
-        expected += 1
-        path = bucket_path(config, account, left)
-        try:
-            state = load_bucket(path, config, account, left, right)
-            active = state.get("active")
-            if not active:
-                raise ValueError("missing active snapshot")
-            summaries.append(active["summary"])
-            present += 1
-            if not active.get("complete") or state.get("last_errors") or state.get("in_progress"):
-                errors.append({"scope": iso(left), "error_type": "IncompleteCollection"})
-        except (OSError, ValueError, KeyError, TypeError):
-            errors.append({"scope": iso(left), "error_type": "MissingOrInvalidBucket"})
-    merged = merge_summaries(summaries, start, end, dimension="ip")
+
+    def summaries():
+        nonlocal expected, present
+        for left, right in report_segments(config, start, end):
+            expected += 1
+            path = bucket_path(config, account, left)
+            try:
+                state = load_bucket(path, config, account, left, right)
+                active = state.get("active")
+                if not active:
+                    raise ValueError("missing active snapshot")
+                present += 1
+                if not active.get("complete") or state.get("last_errors") or state.get("in_progress"):
+                    errors.append({"scope": iso(left), "error_type": "IncompleteCollection"})
+                # Merge each segment before reading the next. Peak report input
+                # memory then depends on one bucket instead of all 48/96 files.
+                yield active["summary"]
+            except (OSError, ValueError, KeyError, TypeError):
+                errors.append({"scope": iso(left), "error_type": "MissingOrInvalidBucket"})
+
+    merged = merge_summaries(summaries(), start, end, dimension="ip")
     return {**merged, **({"artifact_tag": window_tag(config), "report_kind": "configured_window"} if custom else {}),
             "account_id": account["ACCOUNT_ID"], "account_name": account["NAME"],
             "date": day.isoformat(), "timezone": config["TIMEZONE"], "generated_at": iso(now),
