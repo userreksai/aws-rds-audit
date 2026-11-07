@@ -95,7 +95,7 @@ class WindowDeliveryTests(MultiFixture):
         self.assertEqual(str(message["Subject"]), "AW-RDS审计报告 昨日到当前 2026-11-03 09:23:45")
         body = message.get_body(preferencelist=("plain",)).get_content()
         self.assertIn("2026-11-02 00:00:00 至 2026-11-03 09:23:45", body)
-        self.assertIn("Asia/Shanghai", body)
+        self.assertIn("查询范围（北京时间，结束时刻不含）：", body)
         self.assertIn("临近", body.replace("最近", "临近"))
         attachments = list(message.iter_attachments())
         self.assertEqual(len(attachments), 2)
@@ -148,7 +148,7 @@ class WindowDeliveryTests(MultiFixture):
         smtp.send_message.assert_called_once()
         message = smtp.send_message.call_args.args[0]
         self.assertIn("数据不完整", str(message["Subject"]))
-        self.assertIn("production (123456789012)：数据不完整", message.get_body(preferencelist=("plain",)).get_content())
+        self.assertIn("production-123456789012：数据不完整", message.get_body(preferencelist=("plain",)).get_content())
         self.assertEqual(len(list(message.iter_attachments())), 2)
         self.assertFalse(self.manual_report(self.account)[1]["complete"])
         self.assertTrue(self.manual_report(self.config["ACCOUNTS"][1])[1]["complete"])

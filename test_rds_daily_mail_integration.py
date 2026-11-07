@@ -73,7 +73,8 @@ class ScheduledDailyMailIntegrationTests(MultiFixture):
         message = self.smtp.send_message.call_args.args[0]
         self.assertEqual(str(message["Subject"]), "AW-RDS审计报告 2026-11-04")
         body = message.get_body(preferencelist=("plain",)).get_content()
-        self.assertIn("2026-11-03 00:00:00 至 2026-11-04 00:00:00（Asia/Shanghai", body)
+        self.assertIn("查询范围（北京时间，结束时刻不含）：\n2026-11-03 00:00:00 至 2026-11-04 00:00:00", body)
+        self.assertIn("<table", message.get_body(preferencelist=("html",)).get_content())
         self.assertNotIn("影响行数", body)
         self.assertNotIn("最终事务提交数", body)
         self.assertTrue(all("2026-11-03-RDS-IP审计.pdf" in part.get_filename()

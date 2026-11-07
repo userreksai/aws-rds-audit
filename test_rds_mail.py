@@ -71,6 +71,23 @@ class MailTests(unittest.TestCase):
         self.assertTrue(smtp.starttls.call_args.kwargs["context"].check_hostname)
 
     @patch("rds_mail.smtplib.SMTP_SSL")
+    def test_html_and_plain_alternatives_share_one_message_and_all_pdf_attachments(self, constructor):
+        smtp = self.server()
+        constructor.return_value = smtp
+        send_reports(self.config, self.files, "纯文本摘要", html_body="<html><body><table><tr><td>汇总</td></tr></table></body></html>")
+        smtp.send_message.assert_called_once()
+        message = smtp.send_message.call_args.args[0]
+        self.assertIn("纯文本摘要", message.get_body(preferencelist=("plain",)).get_content())
+        self.assertIn("<table>", message.get_body(preferencelist=("html",)).get_content())
+        self.assertEqual(len(list(message.iter_attachments())), len(self.files))
+
+    @patch("rds_mail.smtplib.SMTP_SSL")
+    def test_invalid_html_body_fails_before_smtp(self, constructor):
+        with self.assertRaises(ValueError):
+            send_reports(self.config, self.files, "摘要", html_body={"bad": "HTML"})
+        constructor.assert_not_called()
+
+    @patch("rds_mail.smtplib.SMTP_SSL")
     def test_partial_refusal_is_uncertain_and_never_success(self, constructor):
         smtp = self.server()
         smtp.send_message.return_value = {"copy@example.com": (550, b"refused private-auth-code")}

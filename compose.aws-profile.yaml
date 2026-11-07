@@ -1,0 +1,9 @@
+services:
+  audit:
+    volumes:
+      - type: bind
+        source: ${AUDIT_AWS_DIR:?Set AUDIT_AWS_DIR to the existing AWS profile directory}
+        target: /root/.aws
+        read_only: true
+        bind:
+          create_host_path: false

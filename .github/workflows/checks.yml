@@ -19,10 +19,71 @@ jobs:
       - run: python -m unittest discover -v
         env:
           AWS_EC2_METADATA_DISABLED: 'true'
+      - name: Verify streaming across 100000 SQL events offline
+        if: matrix.python-version == '3.12'
+        run: python -m unittest test_rds_pagination_review.PaginationReviewTests.test_streams_100000_unique_events_with_empty_pages_and_duplicates -v
+        env:
+          AWS_EC2_METADATA_DISABLED: 'true'
+          RDS_REVIEW_STRESS: '1'
       - run: bash -n install.sh
       - run: bash -n install-mail.sh
+      - run: bash -n install-docker.sh
       - name: Validate systemd calendar and unit syntax
         run: |
           systemd-analyze calendar '*-*-* 08:10:00 Asia/Shanghai'
           python -m unittest test_unit_render.SystemdIntegrationTests -v
           python -m unittest test_mail_install.MailSystemdIntegrationTests -v
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production image
+        run: |
+          printf 'PRIVATE-CANARY' > rds-audit-config.json
+          mkdir -p output .aws
+          printf 'PRIVATE-CANARY' > .aws/credentials
+          printf 'PRIVATE-CANARY' > output/private-report.txt
+          docker build -t aws-rds-audit:ci .
+          docker compose -f compose.yaml config --quiet
+      - name: Verify offline production delivery and restart persistence
+        run: |
+          mkdir -p "$RUNNER_TEMP/rds-data"
+          for pass in first restart; do
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+              --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+              --mount "type=bind,src=$RUNNER_TEMP/rds-data,dst=/data" \
+              --mount "type=bind,src=$PWD/deploy/docker_smoke.py,dst=/tmp/docker_smoke.py,readonly" \
+              --entrypoint /app/.venv/bin/python aws-rds-audit:ci /tmp/docker_smoke.py /data
+          done
+          docker run --rm --network none --entrypoint /app/.venv/bin/python aws-rds-audit:ci -c \
+            "from pathlib import Path; assert not any(Path(p).exists() for p in ['/app/.aws','/app/rds-audit-config.json','/app/output','/app/.git'])"
+      - name: Verify installer dry run and shell syntax
+        run: |
+          bash -n install-docker.sh
+          bash install-docker.sh --dry-run --data-dir /srv/rds-offline --no-start
+      - name: Verify container scheduling health and shutdown without AWS
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'rds-runtime.json'
+          path.write_text(json.dumps({'OUTPUT_DIRECTORY': '/data', 'AUTO_MAIL_MAX_PER_DAY': 0,
+              'ACCOUNTS': [{'NAME': 'offline', 'ACCOUNT_ID': '000000000001', 'ENABLED': False}]}))
+          path.chmod(0o600)
+          PY
+          trap 'docker rm -f rds-schedule-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name rds-schedule-ci --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+            --mount "type=bind,src=$RUNNER_TEMP/rds-data,dst=/data" \
+            --mount "type=bind,src=$RUNNER_TEMP/rds-runtime.json,dst=/usr/local/aws-rds-shenji/rds-audit-config.json,readonly" \
+            --health-interval 1s --health-start-period 1s --health-timeout 3s aws-rds-audit:ci
+          for attempt in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' rds-schedule-ci)
+            if [ "$status" = healthy ]; then break; fi
+            sleep 1
+          done
+          test "$status" = healthy
+          docker stop --time 25 rds-schedule-ci
+          test "$(docker inspect --format '{{.State.ExitCode}}' rds-schedule-ci)" = 0

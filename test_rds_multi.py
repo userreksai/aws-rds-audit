@@ -793,6 +793,24 @@ class CombinedDeliveryTests(MultiFixture):
         self.assertEqual(sender.call_count, 2)
         self.assertIn("修订", sender.call_args.kwargs["subject"])
 
+    def test_chinese_tag_changes_manual_content_without_renaming_reports_or_exposing_keys(self):
+        sender = Mock(return_value={"message_id": "tagged"})
+        now = MIDNIGHT + timedelta(days=1, hours=9)
+        with patch.object(multi, "build_report", side_effect=self.simple_report), patch("rds_pdf.render_account_pdf", side_effect=self.fake_pdf):
+            first = multi.deliver(self.config, DAY, now, sender=sender)
+            original_paths = list(sender.call_args.args[1])
+            self.account["TAG"] = "生产账号"
+            tagged = multi.deliver(self.config, DAY, now + timedelta(minutes=5), sender=sender)
+            self.assertEqual(tagged["status"], "accepted")
+            self.assertEqual(sender.call_count, 2)
+            self.assertNotEqual(first["fingerprint"], tagged["fingerprint"])
+            self.assertEqual(original_paths, sender.call_args.args[1])
+            self.assertIn("生产账号-123456789012", sender.call_args.args[2])
+            self.assertIn("生产账号-123456789012", sender.call_args.kwargs["html_body"])
+            self.assertNotIn("PRIVATE", sender.call_args.args[2] + sender.call_args.kwargs["html_body"])
+            multi.deliver(self.config, DAY, now + timedelta(minutes=10), sender=sender)
+            self.assertEqual(sender.call_count, 2)
+
     def test_combined_mail_has_one_distinct_pdf_per_enabled_account(self):
         sender = Mock(return_value={"message_id": "offline-message"})
         with patch.object(multi, "build_report", side_effect=self.simple_report), patch("rds_pdf.render_account_pdf", side_effect=self.fake_pdf) as pdf, redirect_stdout(StringIO()):
@@ -807,10 +825,11 @@ class CombinedDeliveryTests(MultiFixture):
             self.assertIn(account["ACCOUNT_ID"], path.name)
             self.assertEqual(path.parent.parent.name, account["NAME"] + "-" + account["ACCOUNT_ID"])
             self.assertIn(account["ACCOUNT_ID"].encode(), path.read_bytes())
-        self.assertIn("2 个账号", sender.call_args.args[2])
+        self.assertIn("账号总数：2", sender.call_args.args[2])
         self.assertNotIn("PRIVATE", sender.call_args.args[2])
         self.assertEqual(sender.call_args.kwargs["subject"], "AW-RDS审计报告 2026-11-03")
-        self.assertIn("2026-11-03 00:00:00 至 2026-11-04 00:00:00（UTC", sender.call_args.args[2])
+        self.assertIn("查询范围（北京时间，结束时刻不含）：\n2026-11-03 08:00:00 至 2026-11-04 08:00:00", sender.call_args.args[2])
+        self.assertIn("<table", sender.call_args.kwargs["html_body"])
         self.assertNotIn("影响行数", sender.call_args.args[2])
         self.assertNotIn("最终事务提交数", sender.call_args.args[2])
 
@@ -876,7 +895,7 @@ class CombinedDeliveryTests(MultiFixture):
             status = multi.deliver(self.config, DAY, MIDNIGHT + timedelta(days=1, hours=9), sender=sender)
         self.assertFalse(status["complete"])
         self.assertIn("数据不完整", sender.call_args.kwargs["subject"])
-        self.assertIn("staging (210987654321)：数据不完整", sender.call_args.args[2])
+        self.assertIn("staging-210987654321：数据不完整", sender.call_args.args[2])
 
     def test_config_precheck_does_not_authenticate_render_send_or_create_output(self):
         path = self.configuration_path()

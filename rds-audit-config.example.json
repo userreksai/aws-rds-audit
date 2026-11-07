@@ -11,13 +11,18 @@
   "RETENTION_DAYS": 7,
   // 日界线、文件归档日期和每日邮件时间所用时区；默认北京时间。
   "TIMEZONE": "Asia/Shanghai",
-  // 启用自动邮件时，每天发送前一自然日汇总的当地时间，格式 HH:MM。
-  "DAILY_MAIL_TIME": "08:10",
+  // 每日邮件时间，格式 HH:MM；不早于统计结束时间加 LOG_DELAY_MINUTES。
+  // 默认10:05采集缓冲后到期的最后一段，10:10再发信，给采集留出一轮时间。
+  "DAILY_MAIL_TIME": "10:10",
+  // 从结束日前一天的此时开始，到结束日的下方时刻为止（结束时刻不含）。
+  // 必须同时填写并对齐30/60分钟采集边界；均留空/均省略则保留旧自然日统计。
+  "REPORT_START_TIME": "10:00",
+  "REPORT_END_TIME": "10:00",
   // 自动邮件每日额度，只允许 0 或 1；0 关闭自动邮件，1 表示所有已启用账号每天合并同一封。
   // 自然日按 TIMEZONE 计算；后续补采只更新本地 PDF，不自动发送修订邮件。
   // SMTP 提交状态不确定时不会自动重发；手动 --report / --since-yesterday 显式发信不受此自动限额限制。
   "AUTO_MAIL_MAX_PER_DAY": 1,
-  // 目前固定 previous_day，即昨日 00:00 到今日 00:00，不是旧版 25 小时窗口。
+  // previous_day 日报模式；配置 REPORT_START/END_TIME 时使用上述跨日窗口。
   "MAIL_REPORT_MODE": "previous_day",
   // 每账号每轮最多处理的分段数；较多账号首次回填时可结合 API 限额调整。
   "MAX_BUCKETS_PER_ACCOUNT_PER_RUN": 6,
@@ -26,8 +31,8 @@
   // 成功分段结束多久后再补读一次迟到日志，单位分钟，允许 0。
   "REFRESH_DELAY_MINUTES": 60,
 
-  // 是否向异常群发送采集失败告警；新配置默认开启，旧版无此字段则保持关闭。
-  "LARK_ALERTS_ENABLED": true,
+  // 是否向异常群发送采集失败告警；填好下方 Webhook 后改为 true。
+  "LARK_ALERTS_ENABLED": false,
   // 填写 Lark 或飞书群机器人的完整 HTTPS Webhook；开启告警时安装前必须填写。
   "LARK_WEBHOOK_URL": "",
   // 机器人开启签名校验时填写签名密钥，否则留空。
@@ -64,11 +69,13 @@
 
   // 当前预留 7 个账号，后续可继续复制账号对象增加，账号总数不受 7 限制。
   // NAME 和 ACCOUNT_ID 各自必须唯一；请把占位 ID 替换为真实 12 位 AWS 账号 ID。
+  // TAG 可选中文标签、最多120字符；邮件显示 TAG-ACCOUNT_ID，留空则使用 NAME。
   // 使用 Key 时成对填写 ID/Secret，临时凭据同时填 Token，并保持 AWS_PROFILE 为空。
   // 使用本机 profile 时只填 AWS_PROFILE，Key/Secret/Token 留空；都为空则使用默认凭据链。
   "ACCOUNTS": [
     {
       "NAME": "account-1", // 账号 1 的目录短名，仅使用字母、数字、下划线和连字符。
+      "TAG": "示例-账号1",
       "ACCOUNT_ID": "000000000001", // 替换为账号 1 的真实 12 位 ID，采集前核验 Key 归属。
       "ENABLED": true, // false 暂停此账号采集与邮件附件。
       "AWS_ACCESS_KEY_ID": "", // 填写账号 1 的 Access Key ID。
@@ -79,6 +86,7 @@
     },
     {
       "NAME": "account-2", // 账号 2 的唯一目录短名。
+      "TAG": "示例-账号2",
       "ACCOUNT_ID": "000000000002", // 替换为账号 2 的真实 12 位 ID。
       "ENABLED": true, // false 暂停账号 2。
       "AWS_ACCESS_KEY_ID": "", // 账号 2 的 Access Key ID。
@@ -89,6 +97,7 @@
     },
     {
       "NAME": "account-3", // 账号 3 的唯一目录短名。
+      "TAG": "示例-账号3",
       "ACCOUNT_ID": "000000000003", // 替换为账号 3 的真实 12 位 ID。
       "ENABLED": true, // false 暂停账号 3。
       "AWS_ACCESS_KEY_ID": "", // 账号 3 的 Access Key ID。
@@ -99,6 +108,7 @@
     },
     {
       "NAME": "account-4", // 账号 4 的唯一目录短名。
+      "TAG": "示例-账号4",
       "ACCOUNT_ID": "000000000004", // 替换为账号 4 的真实 12 位 ID。
       "ENABLED": true, // false 暂停账号 4。
       "AWS_ACCESS_KEY_ID": "", // 账号 4 的 Access Key ID。
@@ -109,6 +119,7 @@
     },
     {
       "NAME": "account-5", // 账号 5 的唯一目录短名。
+      "TAG": "示例-账号5",
       "ACCOUNT_ID": "000000000005", // 替换为账号 5 的真实 12 位 ID。
       "ENABLED": true, // false 暂停账号 5。
       "AWS_ACCESS_KEY_ID": "", // 账号 5 的 Access Key ID。
@@ -119,6 +130,7 @@
     },
     {
       "NAME": "account-6", // 账号 6 的唯一目录短名。
+      "TAG": "示例-账号6",
       "ACCOUNT_ID": "000000000006", // 替换为账号 6 的真实 12 位 ID。
       "ENABLED": true, // false 暂停账号 6。
       "AWS_ACCESS_KEY_ID": "", // 账号 6 的 Access Key ID。
@@ -129,6 +141,7 @@
     },
     {
       "NAME": "account-7", // 账号 7 的唯一目录短名；新增账号继续复制这一对象。
+      "TAG": "示例-账号7",
       "ACCOUNT_ID": "000000000007", // 替换为账号 7 的真实 12 位 ID。
       "ENABLED": true, // false 暂停账号 7。
       "AWS_ACCESS_KEY_ID": "", // 账号 7 的 Access Key ID。
